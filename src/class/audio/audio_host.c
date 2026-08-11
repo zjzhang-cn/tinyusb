@@ -697,7 +697,10 @@ bool tuh_audio_receive(uint8_t idx, uint8_t as_idx, uint8_t *buffer, uint16_t le
   audioh_interface_t *p_audio = &_audioh_itf[idx];
   tuh_audio_as_info_t        *as      = &p_audio->as[as_idx];
   TU_VERIFY(as->ep_addr != 0);
-
+  if (usbh_edpt_busy(p_audio->daddr, as->ep_addr)) {
+    TU_LOG_DRV("AUDIO send EP %02x busy\r\n", as->ep_addr);
+    return false;
+  }
   return usbh_edpt_xfer(p_audio->daddr, as->ep_addr, buffer, len);
 }
 
@@ -706,7 +709,10 @@ bool tuh_audio_send(uint8_t idx, uint8_t as_idx, uint8_t *buffer, uint16_t len) 
   audioh_interface_t *p_audio = &_audioh_itf[idx];
   tuh_audio_as_info_t        *as      = &p_audio->as[as_idx];
   TU_VERIFY(as->ep_addr != 0);
-
+  if (usbh_edpt_busy(p_audio->daddr, as->ep_addr)) {
+    TU_LOG_DRV("AUDIO send EP %02x busy\r\n", as->ep_addr);
+    return false;
+  }
   return usbh_edpt_xfer(p_audio->daddr, as->ep_addr, (uint8_t *)buffer, len);
 }
 

@@ -23,16 +23,16 @@
 // MACRO TYPEDEF CONSTANT ENUM DECLARATION
 //--------------------------------------------------------------------+
 
-static bool          audio_mounted       = false;
-static uint8_t       audio_dev_addr      = 0xFF;
-static volatile bool audio_ready         = false; // Wait for sampling freq set before starting isochronous transfer
-static volatile bool audio_rx_busy       = false; // Track IN endpoint transfer state
-static volatile bool audio_tx_busy       = false; // Track OUT endpoint transfer state
-static uint8_t       audio_idx           = 0xFF;
-static uint8_t       audiostream_in_idx  = 0xFF;
-static uint8_t       audiostream_out_idx = 0xFF;
-static uint32_t      sampling_freq       = 48000; // Default sampling frequency (Hz)
-static uint8_t       audio_mic_channels  = 1;
+static bool              audio_mounted       = false;
+static uint8_t           audio_dev_addr      = 0xFF;
+static volatile bool     audio_ready         = false; // Wait for sampling freq set before starting isochronous transfer
+static volatile bool     audio_rx_busy       = false;
+static volatile uint32_t audio_rx_count      = 0;
+static uint8_t           audio_idx           = 0xFF;
+static uint8_t           audiostream_in_idx  = 0xFF;
+static uint8_t           audiostream_out_idx = 0xFF;
+static uint32_t          sampling_freq       = 48000; // Default sampling frequency (Hz)
+static uint8_t           audio_mic_channels  = 1;
 
 static uint8_t audio_rx_buffer[CFG_TUH_AUDIO_EPIN_BUFSIZE] __attribute__((aligned(4)));
 static uint8_t audio_tx_buffer[CFG_TUH_AUDIO_EPOUT_BUFSIZE] __attribute__((aligned(4)));
@@ -90,16 +90,79 @@ static void print_as_interfaces(uint8_t idx) {
 
 //--------------------------------------------------------------------+
 // Application Task
+//
+// 提交顺序敏感性 (UAC 1.0, DWC2 host slave 模式)
+// =================================================
+// 现象: 读 (IN capture) 和写 (OUT playback) 并发时,若先提交 IN 再提交
+//       OUT (本文件当前顺序, 情况1), 写入约 11~36 次后 busy 永远不清除
+//       (tuh_audio_send 返回 0), 读始终正常。
+//
+// 原因: hcd_dwc2.c 的 dfifo_host_init() 把 periodic TX FIFO (PTX) 放在
+//       地址 0, 与 RX FIFO 地址重叠 (HPTXFSIZ/GNPTXFSIZ 的起始地址在
+//       bits 15:0, 深度在 bits 31:16, 原代码传参顺序颠倒)。OUT 数据写
+//       入会覆盖尚未读走的 IN 接收数据, core 将该请求标记为不完整
+//       periodic transfer (PXFR_INCOMPISOOUT), 并自动置 CHDIS 禁用通道,
+//       且不产生 Channel Halted 中断 -> transfer 永不完成 -> busy 卡死。
+//       修复: 把 PTX 移到 RX 上方、NPTX 移到最顶部 (commit
+//       "fix(dwc2): place periodic TX FIFO above RX FIFO to avoid overlap")。
+//
+// 修复前的现象矩阵:
+//   1. task 中先 IN 后 OUT        -> OUT 卡死 (busy 不复位), IN 正常
+//   2. 只写 (OUT)                 -> 稳定
+//   3. 只读 (IN)                  -> 稳定
+//   4. 在 IN 完成回调中提交 OUT    -> 稳定 (时序恰好避开重叠窗口)
+//   5. task 中先 OUT 后 IN        -> 稳定
 //--------------------------------------------------------------------+
+
+#define TASK 1
 void audio_app_task(void) {
   if (!audio_mounted || !audio_ready) {
     return;
   }
 
   if (!audio_rx_busy) {
+
+#if (TASK == 1)             // 现象1
+
     if (tuh_audio_receive(audio_idx, audiostream_in_idx, audio_rx_buffer, CFG_TUH_AUDIO_EPIN_BUFSIZE)) {
-      audio_rx_busy = true;
+      audio_rx_busy = true; // Mark as busy
     }
+    if (audio_rx_count > 0 && audiostream_out_idx != 0xFF) {
+      if (audio_mic_channels == 1) {
+        // Mono microphone, convert to stereo and send to OUT endpoint
+        uint16_t samples = audio_rx_count / 2;
+        mono_to_stereo(audio_rx_buffer, audio_tx_buffer, samples);
+        tuh_audio_send(audio_idx, audiostream_out_idx, audio_tx_buffer, audio_rx_count * 2);
+      } else {
+        // Stereo microphone, send directly to OUT endpoint
+        tuh_audio_send(audio_idx, audiostream_out_idx, audio_rx_buffer, audio_rx_count);
+      }
+      audio_rx_count = 0;
+    }
+#endif
+#if (TASK == 4)             // 现象4
+    if (tuh_audio_receive(audio_idx, audiostream_in_idx, audio_rx_buffer, CFG_TUH_AUDIO_EPIN_BUFSIZE)) {
+      audio_rx_busy = true; // Mark as busy
+    }
+#endif
+#if (TASK == 5)             // 现象5
+    if (audio_rx_count > 0 && audiostream_out_idx != 0xFF) {
+      if (audio_mic_channels == 1) {
+        // Mono microphone, convert to stereo and send to OUT endpoint
+        uint16_t samples = audio_rx_count / 2;
+        mono_to_stereo(audio_rx_buffer, audio_tx_buffer, samples);
+        tuh_audio_send(audio_idx, audiostream_out_idx, audio_tx_buffer, audio_rx_count * 2);
+      } else {
+        // Stereo microphone, send directly to OUT endpoint
+        tuh_audio_send(audio_idx, audiostream_out_idx, audio_rx_buffer, audio_rx_count);
+      }
+      audio_rx_count = 0;
+    }
+
+    if (tuh_audio_receive(audio_idx, audiostream_in_idx, audio_rx_buffer, CFG_TUH_AUDIO_EPIN_BUFSIZE)) {
+      audio_rx_busy = true; // Mark as busy
+    }
+#endif
   }
 }
 
@@ -180,7 +243,6 @@ void tuh_audio_umount_cb(uint8_t idx) {
     audio_mounted       = false;
     audio_ready         = false;
     audio_rx_busy       = false;
-    audio_tx_busy       = false;
     audio_dev_addr      = 0;
     audio_idx           = 0;
     audiostream_in_idx  = 0xFF;
@@ -192,24 +254,22 @@ void tuh_audio_umount_cb(uint8_t idx) {
 void tuh_audio_rx_cb(uint8_t dev_addr, uint8_t ep_addr, uint16_t xferred_bytes) {
   (void)dev_addr;
   (void)ep_addr;
-  audio_rx_busy = false;
-
-  if (xferred_bytes > 0 && audiostream_out_idx != 0xFF && !audio_tx_busy) {
-    bool ok;
+  audio_rx_busy  = false;
+  audio_rx_count = xferred_bytes;
+// 现象4
+#if (TASK == 4)
+  if (audio_rx_count > 0 && audiostream_out_idx != 0xFF) {
     if (audio_mic_channels == 1) {
       // Mono microphone, convert to stereo and send to OUT endpoint
-      uint16_t samples = xferred_bytes / 2;
+      uint16_t samples = audio_rx_count / 2;
       mono_to_stereo(audio_rx_buffer, audio_tx_buffer, samples);
-      ok = tuh_audio_send(audio_idx, audiostream_out_idx, audio_tx_buffer, xferred_bytes * 2);
+      tuh_audio_send(audio_idx, audiostream_out_idx, audio_tx_buffer, audio_rx_count * 2);
     } else {
       // Stereo microphone, send directly to OUT endpoint
-      ok = tuh_audio_send(audio_idx, audiostream_out_idx, audio_rx_buffer, xferred_bytes);
-    }
-
-    if (ok) {
-      audio_tx_busy = true;
+      tuh_audio_send(audio_idx, audiostream_out_idx, audio_rx_buffer, audio_rx_count);
     }
   }
+#endif
 }
 
 // Invoked when an isochronous OUT transfer is complete
@@ -217,5 +277,4 @@ void tuh_audio_tx_cb(uint8_t dev_addr, uint8_t ep_addr, uint16_t xferred_bytes) 
   (void)dev_addr;
   (void)ep_addr;
   (void)xferred_bytes;
-  audio_tx_busy = false;
 }
