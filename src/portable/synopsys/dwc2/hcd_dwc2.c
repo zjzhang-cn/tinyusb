@@ -364,14 +364,14 @@ static void dfifo_host_init(uint8_t rhport, bool is_hs_phy) {
 
   dwc2->gdfifocfg = (dfifo_top << GDFIFOCFG_EPINFOBASE_SHIFT) | dfifo_top;
 
-  dfifo_top -= rxfsiz;
+  // RX FIFO at the bottom (address 0), NPTX at the very top, PTX in between.
+  // Note: HPTXFSIZ/GNPTXFSIZ store the start address in bits 15:0 and the depth
+  // in bits 31:16 (RM0368 34.6.x). Previously PTX was placed at address 0, which
+  // overlaps the RX FIFO and corrupts data when a periodic OUT transfer is written
+  // while receive data is pending - visible as random host channel stalls.
   dwc2->grxfsiz = rxfsiz;
-
-  dfifo_top -= nptxfsiz;
-  dwc2->gnptxfsiz = tu_u32_from_u16(nptxfsiz, dfifo_top);
-
-  dfifo_top -= ptxfsiz;
-  dwc2->hptxfsiz = tu_u32_from_u16(ptxfsiz, dfifo_top);
+  dwc2->gnptxfsiz = tu_u32_from_u16(nptxfsiz, dfifo_top - nptxfsiz);
+  dwc2->hptxfsiz = tu_u32_from_u16(ptxfsiz, rxfsiz);
 }
 
 //--------------------------------------------------------------------+
