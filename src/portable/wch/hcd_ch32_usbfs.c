@@ -31,6 +31,11 @@
 
 #include "ch32v20x_usb.h"
 
+// Internal DMA buffers, used only for transfers without an application buffer
+// (setup packet, control status stage, clear-stall). Data transfers point the
+// DMA directly at the application buffer (see hardware_start_xfer): these
+// 64-byte buffers would be overflowed by larger packets (e.g. FS ISO up to
+// 1023 bytes), smashing adjacent statics such as the endpoint record table.
 #define USBFS_RX_BUF_LEN 64
 #define USBFS_TX_BUF_LEN 64
 TU_ATTR_ALIGNED(4) static uint8_t USBFS_RX_Buf[USBFS_RX_BUF_LEN];
@@ -202,9 +207,26 @@ static bool hardware_start_xfer(uint8_t pid, uint8_t ep_addr, uint8_t data_toggl
     loopdelay(SystemCoreClock / 1000000 * 40);
   }
 
+  // Point the DMA at the transfer buffer itself: the fixed internal TX/RX
+  // buffers are only 64 bytes and would be overflowed by larger packets
+  // (e.g. 192-byte FS isochronous audio), smashing adjacent statics such as
+  // the endpoint record table. Zero-length transfers (control status stage,
+  // buffer == NULL) fall back to the internal buffer, where nothing is written.
+  if (pid == USB_PID_IN) {
+    USBOTG_H_FS->HOST_RX_DMA = (uint32_t) (usb_current_xfer_info.buffer != NULL ? usb_current_xfer_info.buffer : (uint8_t*) USBFS_RX_Buf);
+  } else {
+    USBOTG_H_FS->HOST_TX_DMA = (uint32_t) (usb_current_xfer_info.buffer != NULL ? usb_current_xfer_info.buffer : (uint8_t*) USBFS_TX_Buf);
+  }
+
   uint8_t pid_edpt = (pid << 4) | (tu_edpt_number(ep_addr) & 0x0f);
   USBOTG_H_FS->HOST_TX_CTRL = (data_toggle != 0) ? USBFS_UH_T_TOG : 0;
   USBOTG_H_FS->HOST_RX_CTRL = (data_toggle != 0) ? USBFS_UH_R_TOG : 0;
+  // ISO transfers have no handshake phase: do not expect an ACK from the
+  // device (T_RES=1), otherwise the transfer times out with no response.
+  usb_edpt_t *hw_edpt = get_edpt_record(usb_current_xfer_info.dev_addr, ep_addr);
+  if (hw_edpt != NULL && hw_edpt->xfer_type == TUSB_XFER_ISOCHRONOUS) {
+    USBOTG_H_FS->HOST_TX_CTRL |= USBFS_UH_T_RES;
+  }
   USBOTG_H_FS->HOST_EP_PID = pid_edpt;
   USBOTG_H_FS->INT_EN |= USBFS_UIE_TRANSFER;
   USBOTG_H_FS->INT_FG = USBFS_UIF_TRANSFER;
@@ -271,10 +293,18 @@ bool hcd_deinit(uint8_t rhport) {
 }
 
 static bool int_state_for_portreset = false;
+// Set while a port reset is in progress: the USBFS hardware can assert a
+// DETECT(attach=0) edge while the bus is in reset (SE0). The stack's event
+// loop may re-enable the IRQ between hcd_port_reset() and hcd_port_reset_end()
+// (OSAL queue ops toggle the interrupt), so DETECT edges must be ignored
+// during that window and only the flag cleared. Otherwise the reset edge is
+// reported as a device removal and kills the enumeration.
+static bool port_reset_in_progress = false;
 
 void hcd_port_reset(uint8_t rhport) {
   (void) rhport;
   LOG_CH32_USBFSH("hcd_port_reset()\r\n");
+  port_reset_in_progress = true;
   int_state_for_portreset = interrupt_enabled;
   // NVIC_DisableIRQ(USBFS_IRQn);
   hcd_int_disable(rhport);
@@ -305,6 +335,9 @@ void hcd_port_reset_end(uint8_t rhport) {
 
   // Suppress the attached event
   USBOTG_H_FS->INT_FG |= USBFS_UIF_DETECT;
+
+  // Port reset is complete: resume normal DETECT event reporting
+  port_reset_in_progress = false;
 
   if (int_state_for_portreset) {
     hcd_int_enable(rhport);
@@ -380,6 +413,14 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   if (USBOTG_H_FS->INT_FG & USBFS_UIF_DETECT) {
     // Clear the flag
     USBOTG_H_FS->INT_FG = USBFS_UIF_DETECT;
+
+    // Ignore DETECT edges while a port reset is in progress (see
+    // port_reset_in_progress above): the reset itself can assert an
+    // attach=0 edge that is not a real disconnect.
+    if (port_reset_in_progress) {
+      return;
+    }
+
     // Read the detection state
     bool attached = hardware_device_attached();
     LOG_CH32_USBFSH("hcd_int_handler() attached = %d\r\n", attached ? 1 : 0);
@@ -418,7 +459,10 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     }
 
     if (status & USBFS_UIS_TOG_OK) {
-      edpt_info->data_toggle ^= 0x01;
+      // ISO endpoints never toggle DATA0/1, the toggle tracking is only for control/bulk
+      if (edpt_info->xfer_type != TUSB_XFER_ISOCHRONOUS) {
+        edpt_info->data_toggle ^= 0x01;
+      }
 
       switch (request_pid) {
         case USB_PID_SETUP:
@@ -435,7 +479,7 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
             LOG_CH32_USBFSH("USB_PID_OUT continue...\r\n");
             usb_current_xfer_info.buffer += tx_len;
             uint16_t copylen = TU_MIN(edpt_info->max_packet_size, usb_current_xfer_info.bufferlen);
-            memcpy(USBFS_TX_Buf, usb_current_xfer_info.buffer, copylen);
+            USBOTG_H_FS->HOST_TX_LEN = copylen; // DMA reads directly from usb_current_xfer_info.buffer
             hardware_start_xfer(USB_PID_OUT, ep_addr, edpt_info->data_toggle);
             return;
           }
@@ -445,11 +489,12 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
           usb_current_xfer_info.xferred_len += received_len;
           uint16_t xferred_len = usb_current_xfer_info.xferred_len;
           LOG_CH32_USBFSH("Read %d bytes\r\n", received_len);
-          // if (received_len > 0 && (usb_current_xfer_info.buffer == NULL || usb_current_xfer_info.bufferlen == 0)) {
-          //     PANIC("Data received but buffer not set\r\n");
-          // }
-          memcpy(usb_current_xfer_info.buffer, USBFS_RX_Buf, received_len);
-          usb_current_xfer_info.buffer += received_len;
+          // The packet was DMA'd directly into the destination buffer
+          // (HOST_RX_DMA = usb_current_xfer_info.buffer, see hardware_start_xfer).
+          // Zero-length transfers (buffer == NULL) target the internal RX buffer.
+          if (usb_current_xfer_info.buffer != NULL) {
+            usb_current_xfer_info.buffer += received_len;
+          }
           if ((received_len < edpt_info->max_packet_size) || (xferred_len == usb_current_xfer_info.bufferlen)) {
             // USB device sent all data.
             LOG_CH32_USBFSH("USB_PID_IN completed\r\n");
@@ -471,6 +516,20 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
         }
       }
     } else {
+      // ISO transfers have no handshake phase (T_RES=1): the completion
+      // interrupt fires without a device response, treat it as success.
+      if (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) {
+        LOG_CH32_USBFSH("ISO completed without handshake\r\n");
+        uint16_t done_len = usb_current_xfer_info.xferred_len;
+        if (request_pid == USB_PID_IN) {
+          done_len += USBOTG_H_FS->RX_LEN;
+        } else {
+          done_len += usb_current_xfer_info.bufferlen;
+        }
+        usb_current_xfer_info.is_busy = false;
+        hcd_event_xfer_complete(dev_addr, ep_addr, done_len, XFER_RESULT_SUCCESS, in_isr);
+        return;
+      }
       if (response_pid == USB_PID_STALL) {
         LOG_CH32_USBFSH("STALL response\r\n");
         hcd_edpt_clear_stall(0, dev_addr, ep_addr);
@@ -573,13 +632,16 @@ bool hcd_edpt_xfer(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr, uint8_t *b
 
   if (tu_edpt_dir(ep_addr) == TUSB_DIR_IN) {
     LOG_CH32_USBFSH("hcd_edpt_xfer(): READ, dev_addr=0x%02x, ep_addr=0x%02x, len=%d\r\n", dev_addr, ep_addr, buflen);
-    return hardware_start_xfer(USB_PID_IN, ep_addr, edpt_info->data_toggle);
+    // ISO endpoints never toggle DATA0/1
+    uint8_t const toggle = (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) ? 0 : edpt_info->data_toggle;
+    return hardware_start_xfer(USB_PID_IN, ep_addr, toggle);
   } else {
     LOG_CH32_USBFSH("hcd_edpt_xfer(): WRITE, dev_addr=0x%02x, ep_addr=0x%02x, len=%d\r\n", dev_addr, ep_addr, buflen);
     uint16_t copylen = TU_MIN(edpt_info->max_packet_size, buflen);
     USBOTG_H_FS->HOST_TX_LEN = copylen;
-    memcpy(USBFS_TX_Buf, buffer, copylen);
-    return hardware_start_xfer(USB_PID_OUT, ep_addr, edpt_info->data_toggle);
+    // ISO endpoints never toggle DATA0/1
+    uint8_t const toggle = (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) ? 0 : edpt_info->data_toggle;
+    return hardware_start_xfer(USB_PID_OUT, ep_addr, toggle);
   }
 }
 
@@ -642,6 +704,9 @@ bool hcd_edpt_clear_stall(uint8_t rhport, uint8_t dev_addr, uint8_t ep_addr) {
 
   bool prev_int_state = interrupt_enabled;
   hcd_int_disable(0);
+
+  // This path bypasses hardware_start_xfer(), re-point the TX DMA manually
+  USBOTG_H_FS->HOST_TX_DMA = (uint32_t) USBFS_TX_Buf;
 
   USBOTG_H_FS->HOST_EP_PID = (USB_PID_SETUP << 4) | 0x00;
   USBOTG_H_FS->INT_FG |= USBFS_UIF_TRANSFER;
