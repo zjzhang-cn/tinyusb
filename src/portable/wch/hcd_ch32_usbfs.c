@@ -101,6 +101,18 @@ typedef struct usb_current_xfer_st {
 
 static volatile usb_current_xfer_t usb_current_xfer_info = {};
 
+// ISO transfer completions are held until the next SOF interrupt (frame
+// synchronization): reporting them immediately would let the task re-arm the
+// stream within the same frame and issue more than one token per 1 ms frame.
+// The USBFS controller sends the token as soon as it is armed, the device
+// answers the extra tokens with empty packets, and the callback rate runs at
+// task-loop speed instead of the ~1000/s frame rate. The single hardware
+// transfer slot can complete at most one transfer per endpoint per frame, so
+// a small array covers capture + playback simultaneously (echo mode).
+#define ISO_HELD_EVENTS 4
+static hcd_event_t iso_held[ISO_HELD_EVENTS];
+static volatile uint8_t iso_held_count = 0;
+
 static usb_edpt_t *get_edpt_record(uint8_t dev_addr, uint8_t ep_addr) {
   for (size_t i = 0; i < TU_ARRAY_SIZE(usb_edpt_list); i++) {
     usb_edpt_t *cur = &usb_edpt_list[i];
@@ -188,7 +200,9 @@ static void hardware_init_host(bool enabled) {
     USBOTG_H_FS->HOST_RX_DMA = (uint32_t) USBFS_RX_Buf;
     USBOTG_H_FS->HOST_TX_DMA = (uint32_t) USBFS_TX_Buf;
     // USBOTG_H_FS->INT_EN = USBFS_UIE_TRANSFER | USBFS_UIE_DETECT;
-    USBOTG_H_FS->INT_EN = USBFS_UIE_DETECT;
+    // HST_SOF paces the ISO stream re-arms to one token per 1 ms frame (see
+    // hcd_int_handler). The TRANSFER interrupt stays per-transfer armed.
+    USBOTG_H_FS->INT_EN = USBFS_UIE_DETECT | USBFS_UIE_HST_SOF;
   }
 }
 
@@ -288,6 +302,7 @@ bool hcd_init(uint8_t rhport, const tusb_rhport_init_t *rh_init) {
 bool hcd_deinit(uint8_t rhport) {
   (void) rhport;
   hardware_init_host(false);
+  iso_held_count = 0;
 
   return true;
 }
@@ -363,6 +378,13 @@ tusb_speed_t hcd_port_speed_get(uint8_t rhport) {
 void hcd_device_close(uint8_t rhport, uint8_t dev_addr) {
   (void) rhport;
   LOG_CH32_USBFSH("hcd_device_close(%d, 0x%02x)\r\n", rhport, dev_addr);
+  // Drop held ISO completions of this device (stale once the device is closed)
+  for (uint8_t i = 0; i < iso_held_count; i++) {
+    if (iso_held[i].dev_addr == dev_addr) {
+      iso_held[i] = iso_held[--iso_held_count];
+      i--;
+    }
+  }
   remove_edpt_record_for_device(dev_addr);
 }
 
@@ -388,7 +410,12 @@ void hcd_int_disable(uint8_t rhport) {
 static void xfer_retry(void* _params) {
   LOG_CH32_USBFSH("xfer_retry()\r\n");
   usb_edpt_t* edpt_info = (usb_edpt_t*)_params;
-  if (usb_current_xfer_info.nak_pending) {
+  // Key the retry on the endpoint record's own flag, not the global
+  // nak_pending: an intervening transfer (e.g. the next control stage or an
+  // ISO re-arm from a stream completion callback) clears
+  // usb_current_xfer_info.nak_pending, which would silently drop the retry
+  // and strand the transfer forever.
+  if (edpt_info->is_nak_pending) {
     usb_current_xfer_info.nak_pending = false;
     edpt_info->is_nak_pending = false;
 
@@ -406,11 +433,209 @@ static void xfer_retry(void* _params) {
 }
 
 
+// Report a completed transfer. ISO completions are held until the next SOF
+// interrupt (iso_held) so the stream re-arm issues exactly one token per
+// 1 ms frame; control/bulk/interrupt completions are reported immediately
+// (the single transfer slot is already freed by the caller).
+static void xfer_complete_report(usb_edpt_t *edpt_info, uint8_t dev_addr, uint8_t ep_addr,
+                                 uint32_t len, xfer_result_t result, bool in_isr) {
+  if (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) {
+    if (iso_held_count < ISO_HELD_EVENTS) {
+      hcd_event_t *ev = &iso_held[iso_held_count++];
+      ev->rhport                = 0;
+      ev->event_id              = HCD_EVENT_XFER_COMPLETE;
+      ev->dev_addr              = dev_addr;
+      ev->xfer_complete.ep_addr = ep_addr;
+      ev->xfer_complete.result  = (uint8_t) result;
+      ev->xfer_complete.len     = len;
+    } else {
+      // Overflow fallback: report immediately rather than dropping the event
+      hcd_event_xfer_complete(dev_addr, ep_addr, len, result, in_isr);
+    }
+  } else {
+    hcd_event_xfer_complete(dev_addr, ep_addr, len, result, in_isr);
+  }
+}
+
+// Process a completed transfer. Only called with the SIE idle (see
+// hcd_int_handler); contains the exact baseline completion logic with the
+// ISO completions routed through xfer_complete_report() for frame pacing.
+static void process_xfer_complete(uint8_t rhport, bool in_isr) {
+  // Disable transfer interrupt
+  USBOTG_H_FS->INT_EN &= ~USBFS_UIE_TRANSFER;
+  // Copy PID and Endpoint
+  uint8_t pid_edpt = USBOTG_H_FS->HOST_EP_PID;
+  uint8_t status = USBOTG_H_FS->INT_ST;
+  uint8_t dev_addr = USBOTG_H_FS->DEV_ADDR & USBFS_USB_ADDR_MASK;
+
+  LOG_CH32_USBFSH("hcd_int_handler() pid_edpt=0x%02x\r\n", pid_edpt);
+
+  uint8_t request_pid = pid_edpt >> 4;
+  uint8_t response_pid = status & USBFS_UIS_H_RES_MASK;
+  uint8_t ep_addr = pid_edpt & 0x0f;
+  if (request_pid == USB_PID_IN) {
+    ep_addr |= 0x80;
+  }
+
+  usb_edpt_t *edpt_info = get_edpt_record(dev_addr, ep_addr);
+  if (edpt_info == NULL) {
+    PANIC("\r\nget_edpt_record(0x%02x, 0x%02x) returned NULL in USBHD_IRQHandler\r\n", dev_addr, ep_addr);
+  }
+
+  if (status & USBFS_UIS_TOG_OK) {
+    // ISO endpoints never toggle DATA0/1, the toggle tracking is only for control/bulk
+    if (edpt_info->xfer_type != TUSB_XFER_ISOCHRONOUS) {
+      edpt_info->data_toggle ^= 0x01;
+    }
+
+    switch (request_pid) {
+      case USB_PID_SETUP:
+      case USB_PID_OUT: {
+        uint16_t tx_len = USBOTG_H_FS->HOST_TX_LEN;
+        usb_current_xfer_info.bufferlen -= tx_len;
+        usb_current_xfer_info.xferred_len += tx_len;
+        if (usb_current_xfer_info.bufferlen == 0) {
+          LOG_CH32_USBFSH("USB_PID_%s completed %d bytes\r\n", request_pid == USB_PID_OUT ? "OUT" : "SETUP", usb_current_xfer_info.xferred_len);
+          usb_current_xfer_info.is_busy = false;
+          xfer_complete_report(edpt_info, dev_addr, ep_addr, usb_current_xfer_info.xferred_len, XFER_RESULT_SUCCESS, in_isr);
+          return;
+        } else {
+          LOG_CH32_USBFSH("USB_PID_OUT continue...\r\n");
+          usb_current_xfer_info.buffer += tx_len;
+          uint16_t copylen = TU_MIN(edpt_info->max_packet_size, usb_current_xfer_info.bufferlen);
+          USBOTG_H_FS->HOST_TX_LEN = copylen; // DMA reads directly from usb_current_xfer_info.buffer
+          hardware_start_xfer(USB_PID_OUT, ep_addr, edpt_info->data_toggle);
+          return;
+        }
+      }
+      case USB_PID_IN: {
+        uint16_t received_len = USBOTG_H_FS->RX_LEN;
+        usb_current_xfer_info.xferred_len += received_len;
+        uint16_t xferred_len = usb_current_xfer_info.xferred_len;
+        LOG_CH32_USBFSH("Read %d bytes\r\n", received_len);
+        // The packet was DMA'd directly into the destination buffer
+        // (HOST_RX_DMA = usb_current_xfer_info.buffer, see hardware_start_xfer).
+        // Zero-length transfers (buffer == NULL) target the internal RX buffer.
+        if (usb_current_xfer_info.buffer != NULL) {
+          usb_current_xfer_info.buffer += received_len;
+        }
+        if ((received_len < edpt_info->max_packet_size) || (xferred_len == usb_current_xfer_info.bufferlen)) {
+          // USB device sent all data.
+          LOG_CH32_USBFSH("USB_PID_IN completed\r\n");
+          usb_current_xfer_info.is_busy = false;
+          xfer_complete_report(edpt_info, dev_addr, ep_addr, xferred_len, XFER_RESULT_SUCCESS, in_isr);
+          return;
+        } else {
+          // USB device may send more data.
+          LOG_CH32_USBFSH("Read more data\r\n");
+          hardware_start_xfer(USB_PID_IN, ep_addr, edpt_info->data_toggle);
+          return;
+        }
+      }
+      default: {
+        LOG_CH32_USBFSH("hcd_int_handler() L%d: unexpected response PID: 0x%02x\r\n", __LINE__, response_pid);
+        usb_current_xfer_info.is_busy = false;
+        xfer_complete_report(edpt_info, dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
+        return;
+      }
+    }
+  } else {
+    // ISO transfers have no handshake phase (T_RES=1): the completion
+    // interrupt fires without a device response, treat it as success.
+    if (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) {
+      LOG_CH32_USBFSH("ISO completed without handshake\r\n");
+      uint16_t done_len = usb_current_xfer_info.xferred_len;
+      if (request_pid == USB_PID_IN) {
+        done_len += USBOTG_H_FS->RX_LEN;
+      } else {
+        done_len += usb_current_xfer_info.bufferlen;
+      }
+      usb_current_xfer_info.is_busy = false;
+      xfer_complete_report(edpt_info, dev_addr, ep_addr, done_len, XFER_RESULT_SUCCESS, in_isr);
+      return;
+    }
+    if (response_pid == USB_PID_STALL) {
+      LOG_CH32_USBFSH("STALL response\r\n");
+      hcd_edpt_clear_stall(0, dev_addr, ep_addr);
+      edpt_info->data_toggle = 0;
+      hardware_start_xfer(request_pid, ep_addr, 0);
+      return;
+    } else if (response_pid == USB_PID_NAK) {
+      LOG_CH32_USBFSH("NAK reposense\r\n");
+      uint32_t elapsed_time = tusb_time_millis_api() - usb_current_xfer_info.start_ms;
+      (void)elapsed_time;
+      if (edpt_info->xfer_type == TUSB_XFER_INTERRUPT) {
+        usb_current_xfer_info.is_busy = false;
+        xfer_complete_report(edpt_info, dev_addr, ep_addr, 0, XFER_RESULT_SUCCESS, in_isr);
+
+      } else {
+        usb_current_xfer_info.is_busy = false;
+        usb_current_xfer_info.nak_pending = true;
+
+
+        edpt_info->is_nak_pending = true;
+        edpt_info->buflen = usb_current_xfer_info.bufferlen;
+        edpt_info->buf = usb_current_xfer_info.buffer;
+
+        hcd_event_t event = {
+          .rhport = rhport,
+          .dev_addr = dev_addr,
+          .event_id = USBH_EVENT_FUNC_CALL,
+          .func_call = {
+              .func = xfer_retry,
+              .param = edpt_info
+          }
+        };
+        hcd_event_handler(&event, in_isr);
+      }
+      return;
+    } else if (response_pid == USB_PID_DATA0 || response_pid == USB_PID_DATA1) {
+      LOG_CH32_USBFSH("Data toggle mismatched and DATA0/1 (not STALL). RX_LEN=%d\r\n", USBOTG_H_FS->RX_LEN);
+      usb_current_xfer_info.is_busy = false;
+      xfer_complete_report(edpt_info, dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
+      return;
+    } else {
+      LOG_CH32_USBFSH("hcd_int_handler() L%d: unexpected response PID: 0x%02x\r\n", __LINE__, response_pid);
+      usb_current_xfer_info.is_busy = false;
+      xfer_complete_report(edpt_info, dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
+      return;
+    }
+  }
+}
+
 void hcd_int_handler(uint8_t rhport, bool in_isr) {
   (void) rhport;
   (void) in_isr;
 
-  if (USBOTG_H_FS->INT_FG & USBFS_UIF_DETECT) {
+  uint8_t int_fg = USBOTG_H_FS->INT_FG;
+
+  // SOF: pace the ISO stream re-arms to one token per 1 ms frame. ISO
+  // completions are held (iso_held) and released here, so the task re-arms
+  // after the frame boundary and each endpoint sees exactly one token per
+  // frame. The SIE also asserts the TRANSFER flag at frame boundaries while
+  // a transfer is armed (not only on completion), so this branch doubles as
+  // a backstop: an armed transfer with the SIE idle and the flag set is a
+  // genuine completion whose interrupt edge was consumed by the spurious
+  // flag.
+  if (int_fg & USBFS_UIF_HST_SOF) {
+    USBOTG_H_FS->INT_FG = USBFS_UIF_HST_SOF;
+
+    // Process a completed transfer first, then release the held ISO
+    // completions: a completion caught by the backstop is released in the
+    // same frame, so the stream re-arms once per frame (one token per frame
+    // per endpoint) instead of once every two frames.
+    if (usb_current_xfer_info.is_busy && (USBOTG_H_FS->INT_EN & USBFS_UIE_TRANSFER) &&
+        (USBOTG_H_FS->INT_FG & USBFS_UIF_TRANSFER) && (USBOTG_H_FS->MIS_ST & USBFS_UMS_SIE_FREE)) {
+      process_xfer_complete(rhport, in_isr);
+    }
+
+    while (iso_held_count > 0) {
+      iso_held_count--;
+      hcd_event_handler(&iso_held[iso_held_count], in_isr);
+    }
+  }
+
+  if (int_fg & USBFS_UIF_DETECT) {
     // Clear the flag
     USBOTG_H_FS->INT_FG = USBFS_UIF_DETECT;
 
@@ -432,151 +657,16 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
     return;
   }
 
-  if (USBOTG_H_FS->INT_FG & USBFS_UIF_TRANSFER) {
-    // Disable transfer interrupt
-    USBOTG_H_FS->INT_EN &= ~USBFS_UIE_TRANSFER;
-    // Clear the flag
-    // USBOTG_H_FS->INT_FG = USBFS_UIF_TRANSFER;
-    // Copy PID and Endpoint
-    uint8_t pid_edpt = USBOTG_H_FS->HOST_EP_PID;
-    uint8_t status = USBOTG_H_FS->INT_ST;
-    uint8_t dev_addr = USBOTG_H_FS->DEV_ADDR & USBFS_USB_ADDR_MASK;
-    // Clear register to stop transfer
-    // USBOTG_H_FS->HOST_EP_PID = 0x00;
-
-    LOG_CH32_USBFSH("hcd_int_handler() pid_edpt=0x%02x\r\n", pid_edpt);
-
-    uint8_t request_pid = pid_edpt >> 4;
-    uint8_t response_pid = status & USBFS_UIS_H_RES_MASK;
-    uint8_t ep_addr = pid_edpt & 0x0f;
-    if (request_pid == USB_PID_IN) {
-      ep_addr |= 0x80;
-    }
-
-    usb_edpt_t *edpt_info = get_edpt_record(dev_addr, ep_addr);
-    if (edpt_info == NULL) {
-      PANIC("\r\nget_edpt_record(0x%02x, 0x%02x) returned NULL in USBHD_IRQHandler\r\n", dev_addr, ep_addr);
-    }
-
-    if (status & USBFS_UIS_TOG_OK) {
-      // ISO endpoints never toggle DATA0/1, the toggle tracking is only for control/bulk
-      if (edpt_info->xfer_type != TUSB_XFER_ISOCHRONOUS) {
-        edpt_info->data_toggle ^= 0x01;
-      }
-
-      switch (request_pid) {
-        case USB_PID_SETUP:
-        case USB_PID_OUT: {
-          uint16_t tx_len = USBOTG_H_FS->HOST_TX_LEN;
-          usb_current_xfer_info.bufferlen -= tx_len;
-          usb_current_xfer_info.xferred_len += tx_len;
-          if (usb_current_xfer_info.bufferlen == 0) {
-            LOG_CH32_USBFSH("USB_PID_%s completed %d bytes\r\n", request_pid == USB_PID_OUT ? "OUT" : "SETUP", usb_current_xfer_info.xferred_len);
-            usb_current_xfer_info.is_busy = false;
-            hcd_event_xfer_complete(dev_addr, ep_addr, usb_current_xfer_info.xferred_len, XFER_RESULT_SUCCESS, in_isr);
-            return;
-          } else {
-            LOG_CH32_USBFSH("USB_PID_OUT continue...\r\n");
-            usb_current_xfer_info.buffer += tx_len;
-            uint16_t copylen = TU_MIN(edpt_info->max_packet_size, usb_current_xfer_info.bufferlen);
-            USBOTG_H_FS->HOST_TX_LEN = copylen; // DMA reads directly from usb_current_xfer_info.buffer
-            hardware_start_xfer(USB_PID_OUT, ep_addr, edpt_info->data_toggle);
-            return;
-          }
-        }
-        case USB_PID_IN: {
-          uint16_t received_len = USBOTG_H_FS->RX_LEN;
-          usb_current_xfer_info.xferred_len += received_len;
-          uint16_t xferred_len = usb_current_xfer_info.xferred_len;
-          LOG_CH32_USBFSH("Read %d bytes\r\n", received_len);
-          // The packet was DMA'd directly into the destination buffer
-          // (HOST_RX_DMA = usb_current_xfer_info.buffer, see hardware_start_xfer).
-          // Zero-length transfers (buffer == NULL) target the internal RX buffer.
-          if (usb_current_xfer_info.buffer != NULL) {
-            usb_current_xfer_info.buffer += received_len;
-          }
-          if ((received_len < edpt_info->max_packet_size) || (xferred_len == usb_current_xfer_info.bufferlen)) {
-            // USB device sent all data.
-            LOG_CH32_USBFSH("USB_PID_IN completed\r\n");
-            usb_current_xfer_info.is_busy = false;
-            hcd_event_xfer_complete(dev_addr, ep_addr, xferred_len, XFER_RESULT_SUCCESS, in_isr);
-            return;
-          } else {
-            // USB device may send more data.
-            LOG_CH32_USBFSH("Read more data\r\n");
-            hardware_start_xfer(USB_PID_IN, ep_addr, edpt_info->data_toggle);
-            return;
-          }
-        }
-        default: {
-          LOG_CH32_USBFSH("hcd_int_handler() L%d: unexpected response PID: 0x%02x\r\n", __LINE__, response_pid);
-          usb_current_xfer_info.is_busy = false;
-          hcd_event_xfer_complete(dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
-          return;
-        }
-      }
-    } else {
-      // ISO transfers have no handshake phase (T_RES=1): the completion
-      // interrupt fires without a device response, treat it as success.
-      if (edpt_info->xfer_type == TUSB_XFER_ISOCHRONOUS) {
-        LOG_CH32_USBFSH("ISO completed without handshake\r\n");
-        uint16_t done_len = usb_current_xfer_info.xferred_len;
-        if (request_pid == USB_PID_IN) {
-          done_len += USBOTG_H_FS->RX_LEN;
-        } else {
-          done_len += usb_current_xfer_info.bufferlen;
-        }
-        usb_current_xfer_info.is_busy = false;
-        hcd_event_xfer_complete(dev_addr, ep_addr, done_len, XFER_RESULT_SUCCESS, in_isr);
-        return;
-      }
-      if (response_pid == USB_PID_STALL) {
-        LOG_CH32_USBFSH("STALL response\r\n");
-        hcd_edpt_clear_stall(0, dev_addr, ep_addr);
-        edpt_info->data_toggle = 0;
-        hardware_start_xfer(request_pid, ep_addr, 0);
-        return;
-      } else if (response_pid == USB_PID_NAK) {
-        LOG_CH32_USBFSH("NAK reposense\r\n");
-        uint32_t elapsed_time = tusb_time_millis_api() - usb_current_xfer_info.start_ms;
-        (void)elapsed_time;
-        if (edpt_info->xfer_type == TUSB_XFER_INTERRUPT) {
-          usb_current_xfer_info.is_busy = false;
-          hcd_event_xfer_complete(dev_addr, ep_addr, 0, XFER_RESULT_SUCCESS, in_isr);
-
-        } else {
-          usb_current_xfer_info.is_busy = false;
-          usb_current_xfer_info.nak_pending = true;
-
-
-          edpt_info->is_nak_pending = true;
-          edpt_info->buflen = usb_current_xfer_info.bufferlen;
-          edpt_info->buf = usb_current_xfer_info.buffer;
-
-          hcd_event_t event = {
-            .rhport = rhport,
-            .dev_addr = dev_addr,
-            .event_id = USBH_EVENT_FUNC_CALL,
-            .func_call = {
-                .func = xfer_retry,
-                .param = edpt_info
-            }
-          };
-          hcd_event_handler(&event, in_isr);
-        }
-        return;
-      } else if (response_pid == USB_PID_DATA0 || response_pid == USB_PID_DATA1) {
-        LOG_CH32_USBFSH("Data toggle mismatched and DATA0/1 (not STALL). RX_LEN=%d\r\n", USBOTG_H_FS->RX_LEN);
-        usb_current_xfer_info.is_busy = false;
-        hcd_event_xfer_complete(dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
-        return;
-      } else {
-        LOG_CH32_USBFSH("hcd_int_handler() L%d: unexpected response PID: 0x%02x\r\n", __LINE__, response_pid);
-        usb_current_xfer_info.is_busy = false;
-        hcd_event_xfer_complete(dev_addr, ep_addr, 0, XFER_RESULT_FAILED, in_isr);
-        return;
-      }
-    }
+  // A transfer completion is only processed while the SIE is idle: with
+  // HST_SOF enabled the controller also asserts the TRANSFER flag at frame
+  // boundaries while a transaction is still in flight, and processing it
+  // there would read stale INT_ST and mid-flight RX_LEN values that corrupt
+  // the transfer. A spurious flag (SIE busy) is left untouched: the real
+  // completion is caught either by its own interrupt edge or by the SOF
+  // backstop above.
+  if ((int_fg & USBFS_UIF_TRANSFER) && (USBOTG_H_FS->INT_EN & USBFS_UIE_TRANSFER) &&
+      usb_current_xfer_info.is_busy && (USBOTG_H_FS->MIS_ST & USBFS_UMS_SIE_FREE)) {
+    process_xfer_complete(rhport, in_isr);
   }
 }
 
