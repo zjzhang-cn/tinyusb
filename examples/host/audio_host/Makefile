@@ -1,7 +1,12 @@
 include ../../../hw/bsp/family_support.mk
-
+RHPORT_HOST=1
 INC += \
 	src \
+
+CFLAGS += -Wno-unused-function -Wno-unused-variable
+CFLAGS_GCC += -Wno-error=cast-align -Wno-error=null-dereference
+CFLAGS += -g -Og
+LDFLAGS += -g -Og
 
 
 # Example source

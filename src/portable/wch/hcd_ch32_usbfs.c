@@ -83,6 +83,15 @@ typedef struct usb_edpt {
   bool is_nak_pending;
   uint16_t buflen;
   uint8_t* buf;
+
+  // Deferred isochronous completion. The USBFS SIE performs a transaction as
+  // soon as HOST_EP_PID is written (no waiting for the frame boundary), so an
+  // isochronous endpoint would otherwise be polled as fast as the task loop
+  // can re-submit, exceeding the UAC 1.0 requirement of one packet per USB
+  // frame. Instead the completion is parked here and delivered by the SOF
+  // interrupt, once per frame per endpoint.
+  bool iso_pending;
+  uint16_t iso_pending_len;
 } usb_edpt_t;
 
 static usb_edpt_t usb_edpt_list[CFG_TUH_DEVICE_MAX * 6] = {};
@@ -132,6 +141,8 @@ static usb_edpt_t *add_edpt_record(uint8_t dev_addr, uint8_t ep_addr, uint16_t m
   slot->is_nak_pending = false;
   slot->buflen = 0;
   slot->buf = NULL;
+  slot->iso_pending = false;
+  slot->iso_pending_len = 0;
 
   slot->configured = true;
 
@@ -151,6 +162,7 @@ static void remove_edpt_record_for_device(uint8_t dev_addr) {
   for (size_t i = 0; i < TU_ARRAY_SIZE(usb_edpt_list); i++) {
     if (usb_edpt_list[i].configured && usb_edpt_list[i].dev_addr == dev_addr) {
       usb_edpt_list[i].configured = false;
+      usb_edpt_list[i].iso_pending = false;
     }
   }
 }
@@ -167,6 +179,11 @@ static void remove_edpt_record_for_device(uint8_t dev_addr) {
 // }
 
 static bool interrupt_enabled = false;
+
+// Free-running SOF frame counter, incremented once per USB frame by the host
+// SOF timer interrupt. The SIE has no readable frame-number register, so this
+// is the frame time base reported by hcd_frame_number().
+static volatile uint32_t sof_frame_count = 0;
 
 /** Enable or disable USBFS Host function */
 static void hardware_init_host(bool enabled) {
@@ -188,7 +205,9 @@ static void hardware_init_host(bool enabled) {
     USBOTG_H_FS->HOST_RX_DMA = (uint32_t) USBFS_RX_Buf;
     USBOTG_H_FS->HOST_TX_DMA = (uint32_t) USBFS_TX_Buf;
     // USBOTG_H_FS->INT_EN = USBFS_UIE_TRANSFER | USBFS_UIE_DETECT;
-    USBOTG_H_FS->INT_EN = USBFS_UIE_DETECT;
+    // The SOF interrupt provides the 1 ms USB frame time base: it drives
+    // hcd_frame_number() and paces isochronous transfers (see sof_handler).
+    USBOTG_H_FS->INT_EN = USBFS_UIE_DETECT | USBFS_UIE_HST_SOF;
   }
 }
 
@@ -310,6 +329,12 @@ void hcd_port_reset(uint8_t rhport) {
   hcd_int_disable(rhport);
   hardware_update_device_address(0x00);
 
+  // Drop any isochronous completions deferred before the reset: SOFs stop
+  // during bus reset and the endpoint records are stale for the new device.
+  for (size_t i = 0; i < TU_ARRAY_SIZE(usb_edpt_list); i++) {
+    usb_edpt_list[i].iso_pending = false;
+  }
+
   // USBOTG_H_FS->HOST_SETUP = 0x00;
 
   USBOTG_H_FS->HOST_CTRL |= USBFS_UH_BUS_RESET;
@@ -369,7 +394,9 @@ void hcd_device_close(uint8_t rhport, uint8_t dev_addr) {
 uint32_t hcd_frame_number(uint8_t rhport) {
   (void) rhport;
 
-  return tusb_time_millis_api();
+  // The SIE has no readable frame-number register; the frame counter is
+  // maintained by the host SOF timer interrupt (sof_frame_count).
+  return sof_frame_count;
 }
 
 void hcd_int_enable(uint8_t rhport) {
@@ -405,6 +432,37 @@ static void xfer_retry(void* _params) {
   }
 }
 
+// Complete a transfer. Isochronous completions are parked in the endpoint
+// record and delivered by the next SOF interrupt (sof_handler) instead of
+// immediately: the SIE fires a transaction the moment HOST_EP_PID is written,
+// and the audio host driver re-submits on completion, so without this the SIE
+// would poll an isochronous endpoint many times per frame. Deferring the
+// completion to the frame boundary makes the class driver re-arm exactly once
+// per frame (the UAC 1.0 packet cadence).
+static void edpt_xfer_done(usb_edpt_t* edpt, uint8_t dev_addr, uint8_t ep_addr, uint16_t xferred_len, bool in_isr) {
+  if (edpt->xfer_type == TUSB_XFER_ISOCHRONOUS) {
+    edpt->iso_pending = true;
+    edpt->iso_pending_len = xferred_len;
+  } else {
+    hcd_event_xfer_complete(dev_addr, ep_addr, xferred_len, XFER_RESULT_SUCCESS, in_isr);
+  }
+}
+
+// SOF interrupt handler: advance the frame counter and deliver the isochronous
+// completions deferred by edpt_xfer_done(). One completion per endpoint is
+// delivered per frame, so each running isochronous stream is paced at 1 kHz.
+static void sof_handler(void) {
+  sof_frame_count++;
+
+  for (size_t i = 0; i < TU_ARRAY_SIZE(usb_edpt_list); i++) {
+    usb_edpt_t* cur = &usb_edpt_list[i];
+    if (cur->configured && cur->iso_pending) {
+      cur->iso_pending = false;
+      hcd_event_xfer_complete(cur->dev_addr, cur->ep_addr, cur->iso_pending_len, XFER_RESULT_SUCCESS, true);
+    }
+  }
+}
+
 
 void hcd_int_handler(uint8_t rhport, bool in_isr) {
   (void) rhport;
@@ -433,10 +491,21 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
   }
 
   if (USBOTG_H_FS->INT_FG & USBFS_UIF_TRANSFER) {
+    // With the SOF interrupt enabled the ISR fires once per frame even when no
+    // transaction is in flight. The TRANSFER flag is only cleared by starting a
+    // new transfer (hardware_start_xfer writes INT_FG = UIF_TRANSFER), so a
+    // stale edge can be pending here. Ignore it when nothing is in flight: the
+    // completion was already processed and usb_current_xfer_info was reset.
+    // Note: never consume the flag while a transfer is in flight — that write
+    // re-arms the SIE and would start a spurious transaction with a stale
+    // HOST_EP_PID, corrupting the transfer (see the IN-stage RX_LEN garbage).
+    // Only clear it for the stale, nothing-in-flight case.
+    if (!usb_current_xfer_info.is_busy) {
+      USBOTG_H_FS->INT_FG = USBFS_UIF_TRANSFER;
+      return;
+    }
     // Disable transfer interrupt
     USBOTG_H_FS->INT_EN &= ~USBFS_UIE_TRANSFER;
-    // Clear the flag
-    // USBOTG_H_FS->INT_FG = USBFS_UIF_TRANSFER;
     // Copy PID and Endpoint
     uint8_t pid_edpt = USBOTG_H_FS->HOST_EP_PID;
     uint8_t status = USBOTG_H_FS->INT_ST;
@@ -473,7 +542,7 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
           if (usb_current_xfer_info.bufferlen == 0) {
             LOG_CH32_USBFSH("USB_PID_%s completed %d bytes\r\n", request_pid == USB_PID_OUT ? "OUT" : "SETUP", usb_current_xfer_info.xferred_len);
             usb_current_xfer_info.is_busy = false;
-            hcd_event_xfer_complete(dev_addr, ep_addr, usb_current_xfer_info.xferred_len, XFER_RESULT_SUCCESS, in_isr);
+            edpt_xfer_done(edpt_info, dev_addr, ep_addr, usb_current_xfer_info.xferred_len, in_isr);
             return;
           } else {
             LOG_CH32_USBFSH("USB_PID_OUT continue...\r\n");
@@ -499,7 +568,7 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
             // USB device sent all data.
             LOG_CH32_USBFSH("USB_PID_IN completed\r\n");
             usb_current_xfer_info.is_busy = false;
-            hcd_event_xfer_complete(dev_addr, ep_addr, xferred_len, XFER_RESULT_SUCCESS, in_isr);
+            edpt_xfer_done(edpt_info, dev_addr, ep_addr, xferred_len, in_isr);
             return;
           } else {
             // USB device may send more data.
@@ -527,7 +596,7 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
           done_len += usb_current_xfer_info.bufferlen;
         }
         usb_current_xfer_info.is_busy = false;
-        hcd_event_xfer_complete(dev_addr, ep_addr, done_len, XFER_RESULT_SUCCESS, in_isr);
+        edpt_xfer_done(edpt_info, dev_addr, ep_addr, done_len, in_isr);
         return;
       }
       if (response_pid == USB_PID_STALL) {
@@ -577,6 +646,11 @@ void hcd_int_handler(uint8_t rhport, bool in_isr) {
         return;
       }
     }
+  }
+
+  if (USBOTG_H_FS->INT_FG & USBFS_UIF_HST_SOF) {
+    USBOTG_H_FS->INT_FG = USBFS_UIF_HST_SOF;
+    sof_handler();
   }
 }
 

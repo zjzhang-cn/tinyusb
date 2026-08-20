@@ -67,9 +67,9 @@ CC_VERSION := $(shell $(CC) -dumpversion)
 CC_VERSION_MAJOR = $(firstword $(subst ., ,$(CC_VERSION)))
 
 # from version 12
-ifeq ($(strip $(if $(CMDEXE),\
-               $(shell if $(CC_VERSION_MAJOR) geq 12 (echo 1) else (echo 0)),\
-               $(shell expr $(CC_VERSION_MAJOR) \>= 12))), 1)
-LDFLAGS += -Wl,--no-warn-rwx-segment
-endif
+#ifeq ($(strip $(if $(CMDEXE),\
+#               $(shell if $(CC_VERSION_MAJOR) geq 12 (echo 1) else (echo 0)),\
+#               $(shell expr $(CC_VERSION_MAJOR) \>= 12))), 1)
+#LDFLAGS += -Wl,--no-warn-rwx-segment
+#endif
 endif
