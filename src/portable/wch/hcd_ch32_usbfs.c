@@ -37,14 +37,22 @@
     #pragma GCC diagnostic ignored "-Wstrict-prototypes"
   #endif
 
+#if CFG_TUSB_MCU == OPT_MCU_CH32V20X
   #include "ch32v20x.h"
+#elif CFG_TUSB_MCU == OPT_MCU_CH32V307
+  #include "ch32v30x.h"  
+#endif
 
   #ifdef __GNUC__
     #pragma GCC diagnostic pop
   #endif
 
-  #include "ch32v20x_usb.h"
 
+#if CFG_TUSB_MCU == OPT_MCU_CH32V20X
+  #include "ch32v20x_usb.h"
+#elif CFG_TUSB_MCU == OPT_MCU_CH32V307
+  #include "ch32v30x_usb.h"
+#endif
   // Internal DMA buffers, used only for transfers without an application buffer
   // (setup packet, control status stage, clear-stall). Data transfers point the
   // DMA directly at the application buffer (see hardware_start_xfer): these

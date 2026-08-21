@@ -34,6 +34,8 @@ ifeq ($(SPEED),high)
 else
   $(info "Using USBFS driver for FullSpeed mode")
   CFLAGS += -DCFG_TUD_WCH_USBIP_USBFS=1
+  $(info "Using USBFS Host driver")
+  CFLAGS += -DCFG_TUH_WCH_USBIP_USBFS=1  
 endif
 
 LDFLAGS += \
@@ -43,6 +45,7 @@ LDFLAGS += \
 SRC_C += \
 	src/portable/wch/dcd_ch32_usbhs.c \
 	src/portable/wch/dcd_ch32_usbfs.c \
+	src/portable/wch/hcd_ch32_usbfs.c \
 	$(SDK_SRC_DIR)/Core/core_riscv.c \
 	$(SDK_SRC_DIR)/Peripheral/src/${CH32_FAMILY}_gpio.c \
 	$(SDK_SRC_DIR)/Peripheral/src/${CH32_FAMILY}_misc.c \
