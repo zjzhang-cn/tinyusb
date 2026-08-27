@@ -288,6 +288,11 @@ void tuh_audio_playback_cb(uint8_t idx, uint8_t stream_idx, uint16_t xferred_byt
 // resume). xferred_bytes is zero for an activation failure.
 void tuh_audio_err_cb(uint8_t idx, uint8_t stream_idx, uint16_t xferred_bytes);
 
+// Invoked when the application should poll the Audio class driver for isochronous transfers.
+// This callback is called from the main loop or from a TIM interrupt context. The
+// application should call tuh_audio_scheduler_task() at least once every millisecond,
+// or more often if audio data needs to be processed more frequently.
+void tuh_audio_scheduler_task(void);
 //--------------------------------------------------------------------+
 // Internal Class Driver API
 //--------------------------------------------------------------------+

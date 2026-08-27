@@ -555,3 +555,13 @@ static void tuh_audio_mount_async(uintptr_t param) {
 void tuh_audio_mount_cb(uint8_t idx) {
   app_defer_ms_async(100, (app_defer_func_t)tuh_audio_mount_async, idx);
 }
+
+
+// Invoked when the application should poll the Audio class driver for isochronous transfers.
+void audio_scheduler_task(void) {
+  static uint32_t start_ms = 0;
+  if (tusb_time_millis_api() != start_ms) {
+    tuh_audio_scheduler_task();
+  }
+  start_ms = tusb_time_millis_api();
+}

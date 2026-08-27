@@ -45,5 +45,6 @@ int main(void) {
     audio_app_task_read();
     audio_app_task_write();
     defer_queue_task();
+    audio_scheduler_task();
   }
 }

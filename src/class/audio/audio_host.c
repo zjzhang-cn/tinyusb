@@ -47,24 +47,24 @@
 
 #if (CFG_TUH_ENABLED && CFG_TUH_AUDIO)
 
-#include "host/usbh.h"
-#include "host/usbh_pvt.h"
-#include "audio_host.h"
+  #include "host/usbh.h"
+  #include "host/usbh_pvt.h"
+  #include "audio_host.h"
 
-// Level where CFG_TUSB_DEBUG must be at least for this driver is logged
-#ifndef CFG_TUH_AUDIO_LOG_LEVEL
-  #define CFG_TUH_AUDIO_LOG_LEVEL CFG_TUH_LOG_LEVEL
-#endif
+  // Level where CFG_TUSB_DEBUG must be at least for this driver is logged
+  #ifndef CFG_TUH_AUDIO_LOG_LEVEL
+    #define CFG_TUH_AUDIO_LOG_LEVEL CFG_TUH_LOG_LEVEL
+  #endif
 
-#define TU_LOG_DRV(...) TU_LOG(CFG_TUH_AUDIO_LOG_LEVEL, __VA_ARGS__)
+  #define TU_LOG_DRV(...) TU_LOG(CFG_TUH_AUDIO_LOG_LEVEL, __VA_ARGS__)
 
 
-//--------------------------------------------------------------------+
-// MACRO CONSTANT TYPEDEF
-//--------------------------------------------------------------------+
+  //--------------------------------------------------------------------+
+  // MACRO CONSTANT TYPEDEF
+  //--------------------------------------------------------------------+
 
-// Maximum number of supported configurations per stream (per direction)
-#define AUDIOH_MAX_CONFIGS (CFG_TUH_AUDIO_MAX_AS * CFG_TUH_AUDIO_MAX_SAM_FREQ)
+  // Maximum number of supported configurations per stream (per direction)
+  #define AUDIOH_MAX_CONFIGS (CFG_TUH_AUDIO_MAX_AS * CFG_TUH_AUDIO_MAX_SAM_FREQ)
 
 //--------------------------------------------------------------------+
 // Weak stubs: invoked if no strong implementation is available
@@ -549,11 +549,9 @@ bool audioh_xfer_cb(uint8_t dev_addr, uint8_t ep_addr, xfer_result_t result, uin
       tu_fifo_write_n(&s->edpt.ff, s->edpt.ep_buf, bytes);
     }
     tuh_audio_capture_cb(s->idx, s->stream_idx, (uint16_t)xferred_bytes);
-    audioh_stream_capture_xfer(s);
   } else {
     // Playback: notify, then submit the next queued packet
     tuh_audio_playback_cb(s->idx, s->stream_idx, (uint16_t)xferred_bytes);
-    audioh_stream_playback_xfer(s);
   }
   return true;
 }
@@ -1673,6 +1671,25 @@ bool tuh_audio_volume_get(uint8_t idx, uint8_t stream_idx, int16_t *volume, tuh_
   TU_VERIFY(volume != NULL && tuh_audio_volume_range_get(idx, stream_idx, &range), false);
   return audioh_feature_unit_get(idx, stream_idx, AUDIO10_FU_CTRL_VOLUME, 0, volume, AUDIOH_FU_VALUE_I16, complete_cb,
                                  user_data);
+}
+
+// --------------------------------------------------------------------+
+// Audio Scheduler Task
+// --------------------------------------------------------------------+
+void tuh_audio_scheduler_task(void) {
+  for (uint8_t idx = 0; idx < CFG_TUH_AUDIO_MAX; idx++) {
+    audioh_interface_t *p_audio = &_audioh_itf[idx];
+    for (uint8_t i = 0; i < p_audio->stream_count; i++) {
+      tuh_audio_stream_t *s = audioh_get_stream_by_idx(p_audio, i);
+      if (s->running) {
+        if (s->dir == TUSB_DIR_IN) {
+          audioh_stream_capture_xfer(s);
+        } else {
+          audioh_stream_playback_xfer(s);
+        }
+      }
+    }
+  }
 }
 
 #endif
