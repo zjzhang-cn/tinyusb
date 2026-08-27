@@ -24,6 +24,7 @@
 void led_blinking_task(void);
 void audio_app_task_read(void);
 void audio_app_task_write(void);
+void audio_scheduler_timer_init(void);
 void audio_scheduler_task(void);
 void defer_queue_task(void);
 #endif

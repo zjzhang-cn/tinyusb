@@ -246,14 +246,13 @@ void led_blinking_task(void) {
 
   board_led_write(led_state);
   led_state = 1 - led_state; // toggle
-#if 1
+#if 0
   printf(" MIC CB=%lu SPK CB=%lu ERR CB=%lu\r\n", (unsigned long)mic_cb_count, (unsigned long)spk_cb_count,
          (unsigned long)err_cb_count);
+#endif
   mic_cb_count = 0;
   spk_cb_count = 0;
   err_cb_count = 0;
-
-#endif
 }
 
 //--------------------------------------------------------------------+
@@ -557,7 +556,44 @@ void tuh_audio_mount_cb(uint8_t idx) {
 }
 
 
-// Invoked when the application should poll the Audio class driver for isochronous transfers.
+//--------------------------------------------------------------------+
+// STM32F4 1ms Hardware Timer (TIM2)
+//--------------------------------------------------------------------+
+#if CFG_TUSB_MCU == OPT_MCU_STM32F4
+
+  #include "stm32f4xx_hal.h"
+
+void TIM2_IRQHandler(void) {
+  if (TIM2->SR & TIM_SR_UIF) {
+    TIM2->SR &= ~TIM_SR_UIF;
+    if (spk_ready || mic_ready) {
+      tuh_audio_scheduler_task();
+    }
+  }
+}
+
+void audio_scheduler_timer_init(void) {
+  __HAL_RCC_TIM2_CLK_ENABLE();
+
+  // TIM2 on APB1: when APB prescaler > 1, timer clock = APB1 * 2
+  uint32_t tim2_clk = HAL_RCC_GetPCLK1Freq() * 2;
+  TIM2->PSC         = (tim2_clk / 10000) - 1;
+  TIM2->ARR         = 10 - 1;
+  TIM2->EGR         = TIM_EGR_UG;
+  TIM2->SR          = 0;
+  TIM2->DIER        = TIM_DIER_UIE;
+  TIM2->CR1         = TIM_CR1_CEN;
+
+  NVIC_SetPriority(TIM2_IRQn, 2);
+  NVIC_EnableIRQ(TIM2_IRQn);
+}
+void audio_scheduler_task(void) {
+  // nothing to do, the scheduler is called from the TIM2 IRQ
+}
+#else
+//--------------------------------------------------------------------+
+// Software Timer (1 ms)
+//--------------------------------------------------------------------+
 void audio_scheduler_task(void) {
   static uint32_t start_ms = 0;
   if (tusb_time_millis_api() != start_ms) {
@@ -565,3 +601,7 @@ void audio_scheduler_task(void) {
   }
   start_ms = tusb_time_millis_api();
 }
+void audio_scheduler_timer_init(void) {
+  // Not implemented for this target
+}
+#endif

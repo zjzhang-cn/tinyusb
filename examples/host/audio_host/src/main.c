@@ -29,7 +29,7 @@
 /*------------- MAIN -------------*/
 int main(void) {
   board_init();
-
+  audio_scheduler_timer_init();
   printf("TinyUSB Host USB Audio Example\r\n");
   printf("Connect a USB Audio Device (UAC 1.0) to test\r\n");
 
