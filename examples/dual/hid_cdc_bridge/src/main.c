@@ -64,6 +64,25 @@ static struct {
   uint8_t buf[8]; // modifier, reserved, keycode[6]
 } kbd_state;
 
+// Relative pointer: deltas accumulate so a burst of frames does not lose
+// movement when only one report per millisecond can be sent.
+static struct {
+  bool    dirty;
+  uint8_t buttons;
+  int16_t dx;
+  int16_t dy;
+  int8_t  wheel;
+  int8_t  pan;
+} rel_state;
+
+// System control keys (power down / sleep / wake up) are momentary: the press
+// report is followed by a release report on the next tick.
+static struct {
+  bool    press_pending;
+  bool    release_pending;
+  uint8_t code;
+} sys_state;
+
 static uint32_t        blink_interval_ms = 250;
 static bridge_parser_t parser;
 
@@ -129,6 +148,38 @@ static void apply_mouse_button(const bridge_mouse_t *mouse) {
   mouse_state.dirty   = true;
 }
 
+static int16_t saturating_add_i16(int16_t sum, int32_t delta) {
+  const int32_t total = (int32_t)sum + delta;
+  if (total > 32767) {
+    return 32767;
+  }
+  if (total < -32768) {
+    return -32768;
+  }
+  return (int16_t)total;
+}
+
+static void apply_mouse_rel_move(const bridge_mouse_rel_t *mouse) {
+  // x/y are deltas here; accumulate so coalescing into one report per
+  // millisecond keeps the total movement.
+  rel_state.buttons = mouse->buttons;
+  rel_state.dx      = saturating_add_i16(rel_state.dx, mouse->x);
+  rel_state.dy      = saturating_add_i16(rel_state.dy, mouse->y);
+  rel_state.wheel   = saturating_add_i8(rel_state.wheel, mouse->wheel);
+  rel_state.pan     = saturating_add_i8(rel_state.pan, mouse->pan);
+  rel_state.dirty   = true;
+}
+
+static void apply_system_key(const bridge_system_key_t *key) {
+  if (key->code == BRIDGE_SYS_KEY_RELEASE) {
+    sys_state.press_pending   = false;
+    sys_state.release_pending = true;
+  } else if (key->code <= BRIDGE_SYS_KEY_WAKE_UP) {
+    sys_state.code          = key->code;
+    sys_state.press_pending = true;
+  }
+}
+
 static void handle_event(const bridge_evt_t *evt) {
   switch (evt->type) {
     case BRIDGE_EVT_KEYBOARD:
@@ -139,6 +190,12 @@ static void handle_event(const bridge_evt_t *evt) {
       break;
     case BRIDGE_EVT_MOUSE_BUTTON:
       apply_mouse_button(&evt->mouse);
+      break;
+    case BRIDGE_EVT_MOUSE_REL_MOVE:
+      apply_mouse_rel_move(&evt->mouse_rel);
+      break;
+    case BRIDGE_EVT_SYSTEM_KEY:
+      apply_system_key(&evt->system);
       break;
     default:
       break;
@@ -166,22 +223,65 @@ static void cdc_rx_task(void) {
 
 // Send at most one pending report per call; keyboard first since key state is
 // more important than pointer position.
-static void hid_tx_task(void) {
+static void hid_ext_tx_task(void) {
+  if (!sys_state.press_pending && !sys_state.release_pending && !rel_state.dirty) {
+    return;
+  }
+
+  if (!tud_hid_n_ready(HID_INSTANCE_EXT)) {
+    return;
+  }
+
+  // System keys are momentary: press first, release on the next tick.
+  if (sys_state.press_pending) {
+    const uint8_t report = sys_state.code;
+    if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_SYSTEM, &report, sizeof(report))) {
+      sys_state.press_pending   = false;
+      sys_state.release_pending = true;
+    }
+    return;
+  }
+
+  if (sys_state.release_pending) {
+    const uint8_t report = 0;
+    if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_SYSTEM, &report, sizeof(report))) {
+      sys_state.release_pending = false;
+    }
+    return;
+  }
+
+  // Relative pointer: one report carries at most +-127 per axis, the rest stays
+  // accumulated for the following ticks.
+  const int8_t dx = rel_state.dx > 127 ? 127 : (rel_state.dx < -127 ? -127 : (int8_t)rel_state.dx);
+  const int8_t dy = rel_state.dy > 127 ? 127 : (rel_state.dy < -127 ? -127 : (int8_t)rel_state.dy);
+
+  uint8_t report[5];
+  report[0] = rel_state.buttons;
+  report[1] = (uint8_t)dx;
+  report[2] = (uint8_t)dy;
+  report[3] = (uint8_t)rel_state.wheel;
+  report[4] = (uint8_t)rel_state.pan;
+
+  if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_MOUSE_REL, report, sizeof(report))) {
+    rel_state.dx -= dx;
+    rel_state.dy -= dy;
+    rel_state.wheel = 0;
+    rel_state.pan   = 0;
+    rel_state.dirty = (rel_state.dx != 0) || (rel_state.dy != 0);
+  }
+}
+
+static void hid_main_tx_task(void) {
   if (!kbd_state.dirty && !mouse_state.dirty) {
     return;
   }
 
-  if (tud_suspended()) {
-    tud_remote_wakeup();
-    return;
-  }
-
-  if (!tud_hid_ready()) {
+  if (!tud_hid_n_ready(HID_INSTANCE_MAIN)) {
     return;
   }
 
   if (kbd_state.dirty) {
-    if (tud_hid_n_report(0, REPORT_ID_KEYBOARD, kbd_state.buf, sizeof(kbd_state.buf))) {
+    if (tud_hid_n_report(HID_INSTANCE_MAIN, REPORT_ID_KEYBOARD, kbd_state.buf, sizeof(kbd_state.buf))) {
       kbd_state.dirty = false;
     }
     return;
@@ -197,11 +297,27 @@ static void hid_tx_task(void) {
   report[5] = (uint8_t)mouse_state.wheel;
   report[6] = (uint8_t)mouse_state.pan;
 
-  if (tud_hid_n_report(0, REPORT_ID_MOUSE, report, sizeof(report))) {
+  if (tud_hid_n_report(HID_INSTANCE_MAIN, REPORT_ID_MOUSE, report, sizeof(report))) {
     mouse_state.dirty = false;
     mouse_state.wheel = 0;
     mouse_state.pan   = 0;
   }
+}
+
+static void hid_tx_task(void) {
+  const bool pending =
+    sys_state.press_pending || sys_state.release_pending || kbd_state.dirty || mouse_state.dirty || rel_state.dirty;
+  if (!pending) {
+    return;
+  }
+
+  if (tud_suspended()) {
+    tud_remote_wakeup();
+    return;
+  }
+
+  hid_ext_tx_task();  // system keys and relative pointer first
+  hid_main_tx_task(); // keyboard, then absolute pointer
 }
 
 static void led_blinking_task(void) {
