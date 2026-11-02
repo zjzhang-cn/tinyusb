@@ -48,7 +48,17 @@ FSDEV_NAKED_ISR(USB_HP_CAN1_TX_IRQHandler)
 FSDEV_NAKED_ISR(USBWakeUp_IRQHandler)
 
 // Port1: USBFS
+// Weak hook for applications that drive this controller with their own device stack, e.g.
+// examples/dual/hid_cdc_bridge, which needs a second USB device (TinyUSB's device stack is
+// single instance). Leave it empty otherwise.
+void usbfs_isr_hook(void);
+
+__attribute__((weak)) void usbfs_isr_hook(void) {
+}
+
 __attribute__((interrupt)) __attribute__((used)) void USBHD_IRQHandler(void) {
+  usbfs_isr_hook();
+
   #if CFG_TUD_ENABLED && CFG_TUD_WCH_USBIP_USBFS
   tud_int_handler(1);
   #endif
