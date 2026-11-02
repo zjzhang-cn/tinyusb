@@ -175,6 +175,7 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | wheel / pan | `REL_WHEEL` +1 / −1, `REL_HWHEEL` +1, pointer does not move (scroll-only) |
 | wheel + position in one frame | `REL_WHEEL` 2 **and** `ABS_X/Y` updated |
 | relative pointer (`0x8557`) | `REL_X`/`REL_Y` deltas and `REL_WHEEL` on the relative input device |
+| relative pointer, visual | on the target PC a 100x100 unit square (10 steps of 10 units per side, 100 ms apart) traced twice and closed back to the start, no drift and no pointer jump |
 | system key (`0x8657`, power down) | `KEY_POWER` press **and** automatic release on the System Control device |
 | cross-machine run | HID port on a second PC, CDC on the first: one `0x8657 code=1` frame put the target to sleep/shut down |
 | cross-machine sleep + wake | `code=2` suspended the target, `code=3` woke it up — confirms the remote-wakeup + `KEY_WAKEUP` path on real hardware |
