@@ -69,10 +69,20 @@ const uint8_t desc_hid_report[] = {
   TUD_HID_REPORT_DESC_ABSMOUSE(HID_REPORT_ID(REPORT_ID_MOUSE)),
 };
 
+// Relative mouse (report ID 3): 5 buttons, X/Y in -127..127, wheel, pan.
+// System control (report ID 4): power down / sleep / wake up.
+//
+// Kept on a separate interface because Linux's hid-input drops duplicate HID
+// usages within one device: the absolute collection already claims
+// Wheel(0x38), so a second copy would silently lose scrolling.
+const uint8_t desc_hid_report_ext[] = {
+  TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(REPORT_ID_MOUSE_REL)),
+  TUD_HID_REPORT_DESC_SYSTEM_CONTROL(HID_REPORT_ID(REPORT_ID_SYSTEM)),
+};
+
 // Invoked when received GET HID REPORT DESCRIPTOR request
 const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance) {
-  (void)instance;
-  return desc_hid_report;
+  return instance == 0 ? desc_hid_report : desc_hid_report_ext;
 }
 
 //--------------------------------------------------------------------+
@@ -80,7 +90,7 @@ const uint8_t *tud_hid_descriptor_report_cb(uint8_t instance) {
 //--------------------------------------------------------------------+
 
 enum {
-  CONFIG_TOTAL_LEN = TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN
+  CONFIG_TOTAL_LEN = TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN * 2
 };
 
 const uint8_t desc_configuration[] = {
@@ -89,6 +99,8 @@ const uint8_t desc_configuration[] = {
 
   // Interface number, string index, protocol, report descriptor len, EP IN address, size & polling interval
   TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID_IN,
+                     CFG_TUD_HID_EP_BUFSIZE, 1),
+  TUD_HID_DESCRIPTOR(ITF_NUM_HID_EXT, 0, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report_ext), EPNUM_HID_EXT_IN,
                      CFG_TUD_HID_EP_BUFSIZE, 1)};
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR

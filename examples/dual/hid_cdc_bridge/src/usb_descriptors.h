@@ -28,16 +28,25 @@
 
 enum {
   REPORT_ID_KEYBOARD = 1,
-  REPORT_ID_MOUSE
+  REPORT_ID_MOUSE,     // absolute pointer
+  REPORT_ID_MOUSE_REL, // relative pointer
+  REPORT_ID_SYSTEM,    // power down / sleep / wake up
 };
 
 enum {
-  ITF_NUM_HID = 0,
+  ITF_NUM_HID = 0, // keyboard + absolute pointer
+  ITF_NUM_HID_EXT, // relative pointer + system control
   ITF_NUM_TOTAL
 };
 
 enum {
-  EPNUM_HID_IN = 0x81
+  EPNUM_HID_IN     = 0x81,
+  EPNUM_HID_EXT_IN = 0x82
+};
+
+enum {
+  HID_INSTANCE_MAIN = 0, // keyboard + absolute pointer
+  HID_INSTANCE_EXT       // relative pointer + system control
 };
 
 #endif

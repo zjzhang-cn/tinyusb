@@ -38,11 +38,13 @@ does not change. Little-endian, fixed length:
 
 | offset | size | field |
 |---|---|---|
-| 0 | 2 | header: `0x8257` keyboard, `0x8357` mouse move, `0x8457` mouse button |
+| 0 | 2 | header: `0x8257` keyboard, `0x8357` absolute mouse move, `0x8457` mouse button, **`0x8557` relative mouse move**, **`0x8657` system key** |
 | 2 | 8 | payload |
 | 10 | 2 | tail: `0x0900` |
 
-On the wire the header/tail bytes are `57 82` / `57 83` / `57 84` and `00 09`.
+On the wire the header/tail bytes are `57 82` / `57 83` / `57 84` / `57 85` / `57 86`
+and `00 09`. The first three are the original ESP32 product's; the last two are
+additions, so older host software keeps working unchanged.
 
 ### Keyboard payload (`data[0..7]`)
 
@@ -58,8 +60,8 @@ On the wire the header/tail bytes are `57 82` / `57 83` / `57 84` and `00 09`.
 |---|---|---|
 | 0 | u8 | buttons: bit0 left, bit1 middle, bit2 right |
 | 1 | u8 | padding, 0 |
-| 2…3 | i16 | X, absolute 0…4096 |
-| 4…5 | i16 | Y, absolute 0…4096 |
+| 2…3 | i16 | X: absolute 0…4096 (`0x8357`) or delta (`0x8557`) |
+| 4…5 | i16 | Y: same convention as X |
 | **6** | **i8** | **wheel (vertical), relative delta per frame** |
 | **7** | **i8** | **pan (horizontal), relative delta per frame** |
 
@@ -76,6 +78,30 @@ Rules applied by the firmware:
   They are cleared once a report is actually sent.
 - The old ESP32 firmware carried these two bytes on the wire but dropped them
   (its report descriptor had no wheel usage), so the wheel never worked there.
+
+### System key payload (`data[0..7]`, header `0x8657`)
+
+| offset | type | meaning |
+|---|---|---|
+| 0 | u8 | `0` release, `1` power down, `2` sleep, `3` wake up |
+| 1…7 | u8 | padding, 0 |
+
+System keys are momentary: the firmware sends the press report and
+automatically sends the release report on the following millisecond, so a host
+can just send `code` and does not need to track button-up.
+
+### Relative pointer (`0x8557`)
+
+`x`/`y` are deltas in device units, not a position: the target OS moves its own
+cursor. Deltas are accumulated across frames and split into one report per
+millisecond (max ±127 per axis per report), so no movement is lost when the
+host sends faster than the 1 kHz endpoint.
+
+The relative pointer lives on a **second HID interface**. Linux's hid-input
+ignores a HID usage that is already mapped on the same device, and the absolute
+collection already claims `Wheel(0x38)`; keeping both on one interface silently
+lost relative scrolling. Two interfaces also keep the system-control keys on
+their own input device.
 
 Frames are re-synchronised by a byte-stream parser: it scans for a valid header
 and validates the tail, dropping one byte and retrying on mismatch, so lost or
@@ -121,30 +147,35 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 |---|---|
 | `src/main.c` | bridge policy: CDC → HID, report pacing, LED |
 | `src/bridge_protocol.c` | 12-byte frame parser / re-synchronisation |
-| `src/usb_descriptors.c` | HID keyboard + absolute mouse (TinyUSB templates) |
+| `src/usb_descriptors.c` | HID: keyboard + absolute mouse (interface 0), relative mouse + system control (interface 1) |
 | `src/usbfs_cdc.c` | CDC-ACM on the second controller, ring buffers |
 | `tools/bridge_check.py` | host-side acceptance test (Linux, needs `input` group) |
 
 ## Limits
 
 - Keyboard is 6-key rollover (`TUD_HID_REPORT_DESC_KEYBOARD`), no NKRO.
-- Absolute pointer only — there is no relative-mouse mode.
+- Both pointer flavours are exposed at once (absolute report ID 2, relative
+  report ID 3); the host picks. There is no mode switch to negotiate.
+- Only the three system control keys (power down / sleep / wake up) are
+  mapped; consumer/media keys would be another report ID.
 - The CDC stack is a trimmed WCH driver: no notification endpoint usage, no
   suspend/resume handling beyond clearing the interrupt flag.
 - Frames are applied as they arrive; mouse moves are coalesced to one pending
   report so a burst cannot outrun the 1 ms interrupt endpoint.
 
-## Measured (nanoch32v203, GCC12, both ports on one Linux host)
+## Measured (nanoch32v203, xpack GCC15.2, both ports on one Linux host)
 
 | check | result |
 |---|---|
-| build (make / cmake) | 16684 B flash (7.3% of 224 K), 3712 B RAM (18.1% of 20 K) |
-| enumeration | `cafe:4004` **TinyUSB HID Bridge** (keyboard + mouse, `ABS_X/Y` 0…32767) and `cafe:4001` **TinyUSB CDC Bridge** |
+| build (make / cmake) | 16884 B flash (7.4% of 224 K), 4424 B RAM (21.6% of 20 K) |
+| enumeration | `cafe:4004` **TinyUSB HID Bridge** and `cafe:4001` **TinyUSB CDC Bridge**; the HID side yields 4 input devices: Keyboard, Mouse (ABS 0…32767), Mouse (REL), System Control |
 | keyboard frame | `KEY_A` down/up seen on `/dev/input/eventX` |
 | absolute position | `2048/4096` → `16384/32767`, `1024/4096` → `8192/32767` |
 | button-only frame | `BTN_LEFT` down, pointer does not move |
 | wheel / pan | `REL_WHEEL` +1 / −1, `REL_HWHEEL` +1, pointer does not move (scroll-only) |
 | wheel + position in one frame | `REL_WHEEL` 2 **and** `ABS_X/Y` updated |
+| relative pointer (`0x8557`) | `REL_X`/`REL_Y` deltas and `REL_WHEEL` on the relative input device |
+| system key (`0x8657`, power down) | `KEY_POWER` press **and** automatic release on the System Control device |
 | frame split across writes | reassembled correctly |
 | 3 frames in one write | all applied, last one wins |
 | 500-frame burst (6012 B, blocking write) | no loss, final position exact |

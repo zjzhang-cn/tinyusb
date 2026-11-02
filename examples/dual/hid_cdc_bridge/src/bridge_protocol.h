@@ -7,9 +7,14 @@
  *     uint16 header | uint8 data[8] | uint16 tail
  *
  *   header 0x8257 -> keyboard  (modifier, reserved, keycode[6])
- *   header 0x8357 -> mouse move (button, reserved, x, y, wheel, pan)
- *   header 0x8457 -> mouse button (button, reserved, x, y, wheel, pan)
+ *   header 0x8357 -> mouse move, absolute (button, reserved, x, y, wheel, pan)
+ *   header 0x8457 -> mouse button (button, reserved, ...)
+ *   header 0x8557 -> mouse move, relative (button, reserved, dx, dy, wheel, pan)
+ *   header 0x8657 -> system key (power down / sleep / wake up)
  *   tail   0x0900
+ *
+ * The first three headers are the ones the previous ESP32 based product used;
+ * 0x8557 and 0x8657 are additions and can be ignored by older host software.
  *
  * The parser is a byte-stream state machine: CDC delivers arbitrary chunk
  * boundaries, so frames are re-synchronised by scanning for a valid header
@@ -27,18 +32,28 @@
 extern "C" {
 #endif
 
-#define BRIDGE_FRAME_LEN        12
-#define BRIDGE_FRAME_TAIL       0x0900
+#define BRIDGE_FRAME_LEN          12
+#define BRIDGE_FRAME_TAIL         0x0900
 
-#define BRIDGE_HDR_KEYBOARD     0x8257
-#define BRIDGE_HDR_MOUSE_MOVE   0x8357
-#define BRIDGE_HDR_MOUSE_BUTTON 0x8457
+#define BRIDGE_HDR_KEYBOARD       0x8257
+#define BRIDGE_HDR_MOUSE_MOVE     0x8357
+#define BRIDGE_HDR_MOUSE_BUTTON   0x8457
+#define BRIDGE_HDR_MOUSE_REL_MOVE 0x8557
+#define BRIDGE_HDR_SYSTEM_KEY     0x8657
+
+// System key codes, matching the HID system control usage array (1..3).
+#define BRIDGE_SYS_KEY_RELEASE    0
+#define BRIDGE_SYS_KEY_POWER_DOWN 1
+#define BRIDGE_SYS_KEY_SLEEP      2
+#define BRIDGE_SYS_KEY_WAKE_UP    3
 
 typedef enum {
   BRIDGE_EVT_NONE = 0,
   BRIDGE_EVT_KEYBOARD,
   BRIDGE_EVT_MOUSE_MOVE,
   BRIDGE_EVT_MOUSE_BUTTON,
+  BRIDGE_EVT_MOUSE_REL_MOVE,
+  BRIDGE_EVT_SYSTEM_KEY,
 } bridge_evt_type_t;
 
 typedef struct {
@@ -56,11 +71,21 @@ typedef struct {
   int8_t  pan;
 } bridge_mouse_t;
 
+// Same 8-byte payload; x/y carry deltas instead of absolute coordinates.
+typedef bridge_mouse_t bridge_mouse_rel_t;
+
+typedef struct {
+  uint8_t code; // BRIDGE_SYS_KEY_*
+  uint8_t reserved[7];
+} bridge_system_key_t;
+
 typedef struct {
   bridge_evt_type_t type;
   union {
-    bridge_keyboard_t keyboard;
-    bridge_mouse_t    mouse;
+    bridge_keyboard_t   keyboard;
+    bridge_mouse_t      mouse;
+    bridge_mouse_rel_t  mouse_rel;
+    bridge_system_key_t system;
   };
 } bridge_evt_t;
 

@@ -3,7 +3,7 @@
 Host-side smoke test for examples/dual/hid_cdc_bridge.
 
 Sends 12-byte frames to the bridge's CDC port and checks that the HID side
-(the same PC) reports the expected keyboard/mouse events.
+(the same PC) reports the expected keyboard/mouse/system events.
 
 Usage:
   ./bridge_check.py /dev/ttyACM2            # auto-picks /dev/ttyACM* if omitted
@@ -13,6 +13,7 @@ Requires read access to /dev/input/eventX (member of the "input" group).
 """
 
 import argparse
+import fcntl
 import glob
 import os
 import select
@@ -25,12 +26,20 @@ TAIL = 0x0900
 HDR_KEY = 0x8257
 HDR_MOUSE_MOVE = 0x8357
 HDR_MOUSE_BUTTON = 0x8457
+HDR_MOUSE_REL = 0x8557
+HDR_SYSTEM_KEY = 0x8657
+
+SYS_POWER_DOWN = 1
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
 ABS_X, ABS_Y = 0x00, 0x01
 REL_HWHEEL, REL_WHEEL = 0x06, 0x08
-KEY_A = 30  # HID keyboard usage 0x04
-SYN_REPORT = 0
+KEY_A = 30     # HID keyboard usage 0x04
+KEY_POWER = 116
+BTN_LEFT = 0x110
+
+EVIOCGRAB = 0x40044590
+EVIOCGABS = 0x80184540  # EVIOCGABS(0), axis argument is added per axis
 
 EVENT_FMT = "llHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
@@ -50,6 +59,10 @@ def mouse_frame(header, buttons, x, y, wheel=0, pan=0) -> bytes:
     return frame(header, struct.pack("<Bbhhbb", buttons, 0, x, y, wheel, pan))
 
 
+def system_key_frame(code: int) -> bytes:
+    return frame(HDR_SYSTEM_KEY, bytes([code]) + bytes(7))
+
+
 def find_cdc() -> str:
     candidates = sorted(glob.glob("/dev/ttyACM*"))
     if not candidates:
@@ -58,7 +71,13 @@ def find_cdc() -> str:
 
 
 class Evdev:
-    def __init__(self, match: str):
+    """Event device lookup by name, optionally filtered on absolute axes.
+
+    The absolute and relative pointer are both called "<product> Mouse"; only
+    their capabilities tell them apart (the relative one has no ABS axes).
+    """
+
+    def __init__(self, match: str, need_abs=None):
         self.path = None
         for name_path in glob.glob("/sys/class/input/event*/device/name"):
             try:
@@ -66,12 +85,34 @@ class Evdev:
                     name = f.read().strip()
             except OSError:
                 continue
-            if match in name:
-                self.path = "/dev/input/" + name_path.split("/")[4]
-                break
+            if match not in name:
+                continue
+            sysdir = os.path.dirname(name_path)
+            try:
+                with open(os.path.join(sysdir, "capabilities/abs")) as f:
+                    has_abs = f.read().strip() != "0"
+            except OSError:
+                has_abs = False
+            if need_abs is True and not has_abs:
+                continue
+            if need_abs is False and has_abs:
+                continue
+            self.path = "/dev/input/" + name_path.split("/")[4]
+            break
         if self.path is None:
-            raise RuntimeError(f"no event device matching {match!r}")
+            raise RuntimeError(f"no event device matching {match!r} (need_abs={need_abs})")
         self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+
+    def abs_value(self, axis: int):
+        """Current value of an absolute axis (kernel emits nothing when it does
+        not change, so tests must pick a target different from the current one)."""
+        import array
+        buf = array.array("i", [0] * 5)
+        fcntl.ioctl(self.fd, EVIOCGABS + axis, buf, True)
+        return buf[0]
+
+    def grab(self, on: bool):
+        fcntl.ioctl(self.fd, EVIOCGRAB, 1 if on else 0)
 
     def read(self, timeout=1.0):
         events = []
@@ -104,12 +145,16 @@ def main() -> int:
     cdc = args.cdc or find_cdc()
     print(f"CDC port : {cdc}")
 
-    kbd = mouse = None
+    kbd = abs_mouse = rel_mouse = system = None
     if not args.no_evdev:
         kbd = Evdev("HID Bridge Keyboard")
-        mouse = Evdev("HID Bridge Mouse")
+        abs_mouse = Evdev("HID Bridge Mouse", need_abs=True)
+        rel_mouse = Evdev("HID Bridge Mouse", need_abs=False)
+        system = Evdev("System Control")
         print(f"keyboard : {kbd.path}")
-        print(f"mouse    : {mouse.path}")
+        print(f"mouse abs: {abs_mouse.path}")
+        print(f"mouse rel: {rel_mouse.path}")
+        print(f"system   : {system.path}")
 
     fd = os.open(cdc, os.O_RDWR | os.O_NOCTTY)
     os.set_blocking(fd, False)
@@ -130,41 +175,46 @@ def main() -> int:
             keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
             failures += expect((KEY_A, 0) in keys, f"KEY_A up seen (got {keys})")
 
-        # 2. absolute mouse move to the centre: 2048/4096 -> ~16383/32767
-        print("mouse move to centre")
-        if mouse:
-            mouse.read(0.1)
-        os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0, 2048, 2048))
-        if mouse:
-            ev = mouse.read(1.0)
+        # 2. absolute mouse move: 2048/4096 -> ~16384/32767 (pick a target that
+        #    differs from the current position, or the kernel emits no event)
+        target = 1024 if (abs_mouse and abs_mouse.abs_value(ABS_X) == 16384) else 2048
+        print(f"mouse move to {target}/4096")
+        if abs_mouse:
+            abs_mouse.read(0.1)
+        os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0, target, target))
+        if abs_mouse:
+            ev = abs_mouse.read(1.0)
             pos = {c: v for (t, c, v) in ev if t == EV_ABS}
-            failures += expect(abs(pos.get(ABS_X, -1) - 16384) < 200, f"ABS_X ~16384 (got {pos.get(ABS_X)})")
-            failures += expect(abs(pos.get(ABS_Y, -1) - 16384) < 200, f"ABS_Y ~16384 (got {pos.get(ABS_Y)})")
+            expecting = target * 8
+            failures += expect(abs(pos.get(ABS_X, -1) - expecting) < 200,
+                               f"ABS_X ~{expecting} (got {pos.get(ABS_X)})")
+            failures += expect(abs(pos.get(ABS_Y, -1) - expecting) < 200,
+                               f"ABS_Y ~{expecting} (got {pos.get(ABS_Y)})")
 
-        # 3. button-only frame must not move the pointer
+        # 3. absolute button-only frame must not move the pointer
         print("mouse button press (position must not jump)")
-        if mouse:
-            mouse.read(0.1)
+        if abs_mouse:
+            abs_mouse.read(0.1)
         os.write(fd, mouse_frame(HDR_MOUSE_BUTTON, 0x01, 0, 0))
-        if mouse:
-            ev = mouse.read(1.0)
+        if abs_mouse:
+            ev = abs_mouse.read(1.0)
             pos = {c: v for (t, c, v) in ev if t == EV_ABS}
             keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
-            failures += expect((0x110, 1) in keys, f"BTN_LEFT down seen (got {keys})")
-            failures += expect(ABS_X not in pos or abs(pos[ABS_X] - 16384) < 200,
+            failures += expect((BTN_LEFT, 1) in keys, f"BTN_LEFT down seen (got {keys})")
+            failures += expect(ABS_X not in pos or abs(pos[ABS_X] - expecting) < 200,
                                f"ABS_X unchanged (got {pos.get(ABS_X)})")
         os.write(fd, mouse_frame(HDR_MOUSE_BUTTON, 0x00, 0, 0))
-        if mouse:
-            mouse.read(0.5)
+        if abs_mouse:
+            abs_mouse.read(0.5)
 
-        # 4. wheel / pan (relative, carried in the mouse-move frame)
-        print("wheel up / down, horizontal pan")
+        # 4. absolute wheel / pan (relative, carried in the mouse-move frame)
+        print("absolute wheel / pan")
         for wheel, pan, expect_wheel, expect_pan in ((1, 0, 1, 0), (-1, 0, -1, 0), (0, 1, 0, 1)):
-            if mouse:
-                mouse.read(0.1)
+            if abs_mouse:
+                abs_mouse.read(0.1)
             os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0, 0, 0, wheel, pan))
-            if mouse:
-                ev = mouse.read(1.0)
+            if abs_mouse:
+                ev = abs_mouse.read(1.0)
                 rel = {c: v for (t, c, v) in ev if t == EV_REL}
                 pos = {c: v for (t, c, v) in ev if t == EV_ABS}
                 failures += expect(rel.get(REL_WHEEL, 0) == expect_wheel,
@@ -173,34 +223,57 @@ def main() -> int:
                                    f"REL_HWHEEL {expect_pan} (got {rel.get(REL_HWHEEL)})")
                 failures += expect(ABS_X not in pos, "pointer must not move on scroll-only frame")
 
-        # 5. scroll together with a position update
-        print("scroll + move in one frame")
-        if mouse:
-            mouse.read(0.1)
-        os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0, 3072, 1024, 2, 0))
-        if mouse:
-            ev = mouse.read(1.0)
-            rel = {c: v for (t, c, v) in ev if t == EV_REL}
-            pos = {c: v for (t, c, v) in ev if t == EV_ABS}
-            failures += expect(rel.get(REL_WHEEL, 0) == 2, f"REL_WHEEL 2 (got {rel.get(REL_WHEEL)})")
-            failures += expect(abs(pos.get(ABS_X, -1) - 24576) < 200, f"ABS_X ~24576 (got {pos.get(ABS_X)})")
-            failures += expect(abs(pos.get(ABS_Y, -1) - 8192) < 200, f"ABS_Y ~8192 (got {pos.get(ABS_Y)})")
+        # 5. relative pointer: deltas, wheel and buttons
+        print("relative pointer")
+        for dx, dy, wheel, expect_dx, expect_dy in ((30, -20, 0, 30, -20), (-5, 7, 0, -5, 7)):
+            if rel_mouse:
+                rel_mouse.read(0.1)
+            os.write(fd, mouse_frame(HDR_MOUSE_REL, 0, dx, dy, wheel))
+            if rel_mouse:
+                ev = rel_mouse.read(1.0)
+                rel = {c: v for (t, c, v) in ev if t == EV_REL}
+                failures += expect(rel.get(0x00) == expect_dx, f"REL_X {expect_dx} (got {rel.get(0x00)})")
+                failures += expect(rel.get(0x01) == expect_dy, f"REL_Y {expect_dy} (got {rel.get(0x01)})")
 
-        # 6. resynchronisation: garbage in front of a valid frame
+        print("relative wheel")
+        if rel_mouse:
+            rel_mouse.read(0.1)
+        os.write(fd, mouse_frame(HDR_MOUSE_REL, 0, 0, 0, 2))
+        if rel_mouse:
+            ev = rel_mouse.read(1.0)
+            rel = {c: v for (t, c, v) in ev if t == EV_REL}
+            failures += expect(rel.get(REL_WHEEL, 0) == 2, f"REL_WHEEL 2 (got {rel.get(REL_WHEEL)})")
+
+        # 6. system control: power down is a momentary key
+        print("system control key (grabbed, cannot reach the desktop)")
+        if system:
+            system.read(0.1)
+            system.grab(True)
+        try:
+            os.write(fd, system_key_frame(SYS_POWER_DOWN))
+            if system:
+                ev = system.read(1.0)
+                keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
+                failures += expect((KEY_POWER, 1) in keys, f"KEY_POWER down seen (got {keys})")
+                failures += expect((KEY_POWER, 0) in keys, f"KEY_POWER auto-release seen (got {keys})")
+        finally:
+            if system:
+                system.grab(False)
+
+        # 7. resynchronisation: garbage in front of a valid frame
         print("resync after garbage")
-        if mouse:
-            mouse.read(0.1)
+        if abs_mouse:
+            abs_mouse.read(0.1)
         os.write(fd, b"\xff\x00\x57\x82\xaa" + mouse_frame(HDR_MOUSE_MOVE, 0, 1024, 3072))
-        if mouse:
-            ev = mouse.read(1.0)
+        if abs_mouse:
+            ev = abs_mouse.read(1.0)
             pos = {c: v for (t, c, v) in ev if t == EV_ABS}
             failures += expect(abs(pos.get(ABS_X, -1) - 8192) < 200, f"ABS_X ~8192 (got {pos.get(ABS_X)})")
     finally:
         os.close(fd)
-        if kbd:
-            kbd.close()
-        if mouse:
-            mouse.close()
+        for dev in (kbd, abs_mouse, rel_mouse, system):
+            if dev:
+                dev.close()
 
     print("RESULT:", "PASS" if failures == 0 else f"{failures} FAILURE(S)")
     return 0 if failures == 0 else 1

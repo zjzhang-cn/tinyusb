@@ -10,7 +10,8 @@ static inline uint16_t rd16(const uint8_t *p) {
 }
 
 static bool header_is_valid(uint16_t header) {
-  return header == BRIDGE_HDR_KEYBOARD || header == BRIDGE_HDR_MOUSE_MOVE || header == BRIDGE_HDR_MOUSE_BUTTON;
+  return header == BRIDGE_HDR_KEYBOARD || header == BRIDGE_HDR_MOUSE_MOVE || header == BRIDGE_HDR_MOUSE_BUTTON ||
+         header == BRIDGE_HDR_MOUSE_REL_MOVE || header == BRIDGE_HDR_SYSTEM_KEY;
 }
 
 static bridge_evt_type_t header_to_evt(uint16_t header) {
@@ -21,6 +22,10 @@ static bridge_evt_type_t header_to_evt(uint16_t header) {
       return BRIDGE_EVT_MOUSE_MOVE;
     case BRIDGE_HDR_MOUSE_BUTTON:
       return BRIDGE_EVT_MOUSE_BUTTON;
+    case BRIDGE_HDR_MOUSE_REL_MOVE:
+      return BRIDGE_EVT_MOUSE_REL_MOVE;
+    case BRIDGE_HDR_SYSTEM_KEY:
+      return BRIDGE_EVT_SYSTEM_KEY;
     default:
       return BRIDGE_EVT_NONE;
   }
@@ -62,10 +67,21 @@ bool bridge_parser_feed(bridge_parser_t *parser, uint8_t byte, bridge_evt_t *evt
     }
 
     evt->type = header_to_evt(header);
-    if (evt->type == BRIDGE_EVT_KEYBOARD) {
-      memcpy(&evt->keyboard, parser->buf + 2, sizeof(evt->keyboard));
-    } else {
-      memcpy(&evt->mouse, parser->buf + 2, sizeof(evt->mouse));
+    switch (evt->type) {
+      case BRIDGE_EVT_KEYBOARD:
+        memcpy(&evt->keyboard, parser->buf + 2, sizeof(evt->keyboard));
+        break;
+      case BRIDGE_EVT_SYSTEM_KEY:
+        memcpy(&evt->system, parser->buf + 2, sizeof(evt->system));
+        break;
+      case BRIDGE_EVT_MOUSE_REL_MOVE:
+        memcpy(&evt->mouse_rel, parser->buf + 2, sizeof(evt->mouse_rel));
+        break;
+      case BRIDGE_EVT_MOUSE_MOVE:
+      case BRIDGE_EVT_MOUSE_BUTTON:
+      default:
+        memcpy(&evt->mouse, parser->buf + 2, sizeof(evt->mouse));
+        break;
     }
 
     parser->len = 0;
