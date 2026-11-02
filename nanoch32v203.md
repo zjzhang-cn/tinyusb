@@ -51,11 +51,25 @@
 
 | 项 | 值 |
 |---|---|
-| 工具链 | `~/work/ch32/ch32-docker/Toolchain/RISC-V-Embedded-GCC12/bin/riscv-wch-elf-`（另有 GCC15：`RISC-V-Embedded-GCC15/bin/riscv32-wch-elf-`） |
+| 工具链（WCH GCC12，`ch32.env` 默认） | `~/work/ch32/ch32-docker/Toolchain/RISC-V-Embedded-GCC12/bin/riscv-wch-elf-` |
+| 工具链（WCH GCC15） | `~/work/ch32/ch32-docker/Toolchain/RISC-V-Embedded-GCC15/bin/riscv32-wch-elf-` |
+| 工具链（xpack GCC15.2，实测可用） | `~/work/ch32/ch32-docker/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-` |
 | 烧录 | `wlink`（`~/work/ch32/ch32-docker/wlink-linux-x64/wlink`） |
 | 调试 | WCH fork 的 `openocd`（`~/work/ch32/ch32-docker/OpenOCD/OpenOCD/bin/openocd`） |
 | ISP 兜底 | `~/work/ch32/ch32-docker/wchisp-linux-x64/wchisp`（v0.3.0） |
 | 环境脚本 | 仓库上一级的 `../ch32.env` |
+
+换工具链只要覆盖 `CROSS_COMPILE`（注意前缀不同：WCH 的 GCC15 是 `riscv32-wch-elf-`，xpack 是 `riscv-none-elf-`）：
+
+```bash
+# xpack GCC 15.2.0（含 gdb 16.3），清掉旧对象再编
+export CROSS_COMPILE=~/work/ch32/ch32-docker/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-
+cd examples/dual/hid_cdc_bridge && rm -rf _build/nanoch32v203
+make BOARD=nanoch32v203 all
+```
+
+实测同一份代码：GCC12 → 16916 B Flash / 3920 B RAM；xpack GCC15 → 15924 B Flash / 4208 B RAM（两者都能跑，`_build` 必须清空，否则会因 LTO 版本不一致链接失败）。
+
 
 ```bash
 cd /home/gehc/work/ch32/tinyusb
@@ -265,7 +279,10 @@ Info : Listening on port 3333 for gdb connections
 ### 6.2 连接
 
 ```bash
+# WCH GCC12 自带的 gdb
 GDB=~/work/ch32/ch32-docker/Toolchain/RISC-V-Embedded-GCC12/bin/riscv-wch-elf-gdb
+# 或 xpack GCC15.2 自带的 gdb（16.3，实测同样能连 WCH openocd）
+GDB=~/work/ch32/ch32-docker/xpack-riscv-none-elf-gcc-15.2.0-1/bin/riscv-none-elf-gdb
 $GDB -q examples/device/cdc_msc/_build/nanoch32v203/cdc_msc.elf
 ```
 
@@ -304,6 +321,41 @@ quit
 ```
 
 只复位重跑不退出也行：`monitor reset halt` → `monitor resume`。复位后 USB 重新枚举，PC 侧设备号会变（`lsusb` 的 `Device N`），`/dev/ttyACMx` 会重建。
+
+### 6.4.1 两个会把人坑很久的坑（都实测踩过）
+
+**a) `continue` 等不到断点会把 SDI 链路等死**
+
+WCH 的 openocd 走 SDI 两线，靠 GDB 的包维持 `keep_alive()`。如果 `continue` 之后几秒没有任何包（比如断点挂在“需要外部激励才会执行”的函数上，而激励已经停了），会看到：
+
+```
+Error: libusb_bulk_read error: LIBUSB_ERROR_TIMEOUT
+Warn : keep_alive() was not invoked in the 1000 ms timelimit...
+Error: OpenOCD only supports Debug Module version 2 (0.13) and 3 (1.0), not 0 (dmstatus=0x0)
+Info : rejected 'gdb' connection, no more connections allowed
+```
+
+之后探针失步、openocd 拒绝新连接。处理：
+
+- gdb 里 `set remotetimeout 20`；
+- 断点优先打在**周期性**函数上（如 `led_blinking_task`，250 ms 必中），或先布置好激励再 `continue`；
+- 已经失步就 `pkill -x openocd` + `wlink reset` 重来。
+
+**b) gdb 会话被强杀会留下 `ebreak` 在 flash 里（复位也不消失）**
+
+在 flash 地址上下断点时，openocd 允许 gdb 写入软件断点（`ebreak`，`0x00100073`）。如果 gdb 没 `delete` 就断线/被杀，那个字节就**留在 flash 里**，之后固件每次执行到该地址都会触发 breakpoint 异常（`mcause=0x3`），PC 掉进启动文件里的 `j 1b` 默认处理函数，表现是“固件跑到某条路径就假死”。
+
+定位：
+
+```gdb
+p/x $mcause      # 0x3 = breakpoint
+p/x $mepc        # 出事的地址
+x/4xb $mepc      # 看到 73 00 10 00 就是 ebreak
+```
+
+和 ELF 对比（`objdump -d --start-address=... --stop-address=... <elf>`）如果对不上，就是残留断点。
+
+恢复：重新烧写整片（`wlink flash` / `make flash`）。预防：对 flash 地址用 `hbreak`（硬件断点，最多 4 个），并且结束会话时先 `delete`。
 
 ### 6.5 VSCode / cortex-debug
 
@@ -382,6 +434,7 @@ endif
 | `wlink` 找不到设备 | 探针被 openocd 占用（§4.4）；或 `lsusb` 里没有 `1a86:8010`（换线/换口） |
 | `flash-openocd-wch` 末尾报 `Unsupported register` | 正常，退出码 0，镜像已写入 |
 | 烧完 device 不枚举 | 线插错口：device 只走 **USB1**（`RHPORT_DEVICE=0`）；或时钟配置不是 48/96/144 MHz 之一（`board_init` 里有 `TU_ASSERT(0)`） |
+| 烧完 USB1 上的 device 不见了（USB2 上还在） | FSDev 偶尔不跟着 flash reset 重新枚举：`lsusb` 里没有它但固件在跑。再执行一次 `wlink reset` 即可 |
 | host 口不认设备 | host 只能是 **USB2**（Port1）；确认没把 `RHPORT_DEVICE=1` 带进 dual 构建 |
 | CDC 上一个字节都没有 | CDC 只在应用有数据时才输出；先看 UART 横幅确认固件在跑，再让被测事件发生（按键/移动鼠标） |
 | 看起来“卡死” | 先 `monitor halt` + `bt` 看 PC 在哪；空闲停在 `osal_queue_receive` 是正常的 |
