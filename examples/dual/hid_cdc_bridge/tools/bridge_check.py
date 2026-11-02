@@ -106,8 +106,8 @@ def main() -> int:
 
     kbd = mouse = None
     if not args.no_evdev:
-        kbd = Evdev("HID CDC Bridge Keyboard")
-        mouse = Evdev("HID CDC Bridge Mouse")
+        kbd = Evdev("HID Bridge Keyboard")
+        mouse = Evdev("HID Bridge Mouse")
         print(f"keyboard : {kbd.path}")
         print(f"mouse    : {mouse.path}")
 

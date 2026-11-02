@@ -172,20 +172,31 @@ static const uint8_t desc_config[] = {
   0x00,
 };
 
-static const uint8_t desc_lang[] = {0x04, 0x03, 0x09, 0x04};
+static const uint8_t desc_lang[4] = {0x04, 0x03, 0x09, 0x04}; // 0x0409 en-US
 
-static const uint8_t desc_manufacturer[] = {
-  0x0e, 0x03, 'T', 0, 'i', 0, 'n', 0, 'y', 0, 'U', 0, 'S', 0, 'B', 0,
-};
+// String descriptors are built at init so bLength cannot drift from the text.
+// (The WCH example hard-codes bLength in the array: editing the text without
+// editing the length silently truncates the string or reads past the array.)
+#define STR_DESC_MAX_CHARS 32
 
-static const uint8_t desc_product[] = {
-  0x24, 0x03, 'H', 0,   'I', 0,   'D', 0,   ' ', 0,   'C', 0,   'D', 0,   'C',
-  0,    ' ',  0,   'B', 0,   'r', 0,   'i', 0,   'd', 0,   'g', 0,   'e', 0,
-};
+static uint8_t desc_manufacturer[2 + 2 * STR_DESC_MAX_CHARS];
+static uint8_t desc_product[2 + 2 * STR_DESC_MAX_CHARS];
+static uint8_t desc_serial[2 + 2 * STR_DESC_MAX_CHARS];
 
-static const uint8_t desc_serial[] = {
-  0x0e, 0x03, '2', 0, '0', 0, '3', 0, 'C', 0, '1', 0, '0', 0, '1', 0,
-};
+#define DESC_LEN(desc) ((uint16_t)(desc)[0])
+
+static void make_string_descriptor(uint8_t *out, const char *text) {
+  size_t len = strlen(text);
+  if (len > STR_DESC_MAX_CHARS) {
+    len = STR_DESC_MAX_CHARS;
+  }
+  out[0] = (uint8_t)(2 + 2 * len);
+  out[1] = 0x03; // TUSB_DESC_STRING
+  for (size_t i = 0; i < len; i++) {
+    out[2 + 2 * i] = (uint8_t)text[i];
+    out[3 + 2 * i] = 0;
+  }
+}
 
 static const uint8_t *desc_ptr;
 
@@ -331,6 +342,12 @@ static void usbfs_ep_start_tx(uint8_t endp, const uint8_t *buf, uint16_t len) {
 void usbfs_cdc_init(void) {
   usbfs_device_reset_state();
 
+  // Keep the two devices distinguishable in lsusb / device manager: this port
+  // is the control channel, port 0 is the HID one.
+  make_string_descriptor(desc_manufacturer, "TinyUSB");
+  make_string_descriptor(desc_product, "CDC Bridge");
+  make_string_descriptor(desc_serial, "203C10002");
+
   USBFSH->BASE_CTRL = USBFS_UC_RESET_SIE | USBFS_UC_CLR_ALL;
   usbfs_delay_us(10);
   USBFSH->BASE_CTRL = 0x00;
@@ -437,15 +454,15 @@ static void usbfs_setup_stage(void) {
                 break;
               case 1:
                 desc_ptr = desc_manufacturer;
-                len      = sizeof(desc_manufacturer);
+                len      = DESC_LEN(desc_manufacturer);
                 break;
               case 2:
                 desc_ptr = desc_product;
-                len      = sizeof(desc_product);
+                len      = DESC_LEN(desc_product);
                 break;
               case 3:
                 desc_ptr = desc_serial;
-                len      = sizeof(desc_serial);
+                len      = DESC_LEN(desc_serial);
                 break;
               default:
                 errflag = 0xff;

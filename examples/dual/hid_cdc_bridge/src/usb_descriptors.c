@@ -111,7 +111,7 @@ enum {
 static const char *string_desc_arr[] = {
   (const char[]){0x09, 0x04}, // 0: is supported language is English (0x0409)
   "TinyUSB",                  // 1: Manufacturer
-  "HID CDC Bridge",           // 2: Product
+  "HID Bridge",               // 2: Product (the CDC port is "CDC Bridge")
   "203C10001",                // 3: Serial
 };
 

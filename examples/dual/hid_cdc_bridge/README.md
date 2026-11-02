@@ -101,7 +101,8 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 1. Plug **USB1** into the controlling PC (also the one running the script).
 2. Plug **USB2** into the target machine.
 3. On the controlling PC, the CDC port shows up as `/dev/ttyACM*`
-   (VID:PID `cafe:4001`); the HID side of *that same PC* is `cafe:4004`
+   (VID:PID `cafe:4001`, "TinyUSB CDC Bridge"); the HID side of *that same PC* is
+   `cafe:4004` ("TinyUSB HID Bridge")
    (that is only for testing — in production the HID cable goes to the target).
 4. Send frames, e.g. with `tools/bridge_check.py`:
 
@@ -138,7 +139,7 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | check | result |
 |---|---|
 | build (make / cmake) | 16684 B flash (7.3% of 224 K), 3712 B RAM (18.1% of 20 K) |
-| enumeration | `cafe:4004` HID (keyboard + mouse, `ABS_X/Y` 0…32767) and `cafe:4001` CDC |
+| enumeration | `cafe:4004` **TinyUSB HID Bridge** (keyboard + mouse, `ABS_X/Y` 0…32767) and `cafe:4001` **TinyUSB CDC Bridge** |
 | keyboard frame | `KEY_A` down/up seen on `/dev/input/eventX` |
 | absolute position | `2048/4096` → `16384/32767`, `1024/4096` → `8192/32767` |
 | button-only frame | `BTN_LEFT` down, pointer does not move |
