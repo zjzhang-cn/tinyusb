@@ -176,6 +176,7 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | wheel + position in one frame | `REL_WHEEL` 2 **and** `ABS_X/Y` updated |
 | relative pointer (`0x8557`) | `REL_X`/`REL_Y` deltas and `REL_WHEEL` on the relative input device |
 | system key (`0x8657`, power down) | `KEY_POWER` press **and** automatic release on the System Control device |
+| cross-machine run | HID port on a second PC, CDC on the first: one `0x8657 code=1` frame put the target to sleep/shut down |
 | frame split across writes | reassembled correctly |
 | 3 frames in one write | all applied, last one wins |
 | 500-frame burst (6012 B, blocking write) | no loss, final position exact |
