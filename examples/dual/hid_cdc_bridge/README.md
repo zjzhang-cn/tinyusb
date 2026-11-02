@@ -177,6 +177,7 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | relative pointer (`0x8557`) | `REL_X`/`REL_Y` deltas and `REL_WHEEL` on the relative input device |
 | system key (`0x8657`, power down) | `KEY_POWER` press **and** automatic release on the System Control device |
 | cross-machine run | HID port on a second PC, CDC on the first: one `0x8657 code=1` frame put the target to sleep/shut down |
+| cross-machine sleep + wake | `code=2` suspended the target, `code=3` woke it up — confirms the remote-wakeup + `KEY_WAKEUP` path on real hardware |
 | frame split across writes | reassembled correctly |
 | 3 frames in one write | all applied, last one wins |
 | 500-frame burst (6012 B, blocking write) | no loss, final position exact |
