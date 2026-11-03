@@ -34,6 +34,13 @@ uint32_t usbfs_cdc_read(void *buf, uint32_t len);
 // Queue bytes for the host. Returns the number actually queued.
 uint32_t usbfs_cdc_write(const void *buf, uint32_t len);
 
+// Diagnostics: TX transfer arming/completion counters, for the USART1 log.
+extern volatile uint32_t usbfs_dbg_tx_arms;
+extern volatile uint32_t usbfs_dbg_tx_done;
+extern volatile uint32_t usbfs_dbg_tx_stuck;
+extern volatile uint32_t usbfs_dbg_tx_timeout;  // safety-valve resets (host stopped reading)
+extern volatile uint32_t usbfs_dbg_isr_other;
+
 // True when the host has the port open (DTR asserted).
 bool usbfs_cdc_connected(void);
 

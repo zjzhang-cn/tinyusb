@@ -89,6 +89,7 @@ static struct {
   bool     mounted;
   bool     suspended;
   bool     dirty;
+  uint8_t  token;  // echoed from the host's status query
   uint32_t last_ms;
 } status_state = {.dirty = true};
 
@@ -118,6 +119,14 @@ static struct {
   bool wake_logged;
   uint32_t next_ms;
 } log_state;
+
+// Device -> host status frame: the LED bitmap, so the controlling PC can show
+// Caps Lock state without a second channel.
+static void cdc_send_status(void) {
+  uint8_t frame[BRIDGE_FRAME_LEN];
+  bridge_build_status(frame, kbd_led.leds);
+  usbfs_cdc_write(frame, sizeof(frame));
+}
 
 static void log_event(const char* what) {
   printf("[%lu] %s\r\n", (unsigned long) tusb_time_millis_api(), what);
@@ -151,6 +160,11 @@ static void log_task(void) {
            suspended ? "suspended" : (mounted ? "mounted" : "detached"),
            dtr ? "open" : "closed",
            kbd_led.known ? ((kbd_led.leds >> 1) & 1u) : 0u);
+    printf("[%lu] cdc-tx: arms=%lu done=%lu stuck=%lu timeout=%lu isr_other=%lu\r\n", (unsigned long) now,
+           (unsigned long) usbfs_dbg_tx_arms, (unsigned long) usbfs_dbg_tx_done,
+           (unsigned long) usbfs_dbg_tx_stuck, (unsigned long) usbfs_dbg_tx_timeout,
+           (unsigned long) usbfs_dbg_isr_other);
+    cdc_send_status();  // heartbeat so a reconnecting host learns the LED state
   }
 }
 
@@ -264,6 +278,11 @@ static void handle_event(const bridge_evt_t *evt) {
       break;
     case BRIDGE_EVT_SYSTEM_KEY:
       apply_system_key(&evt->system);
+      break;
+    case BRIDGE_EVT_STATUS_REQ:
+      // Host polled us: answer as soon as the loop comes round.
+      status_state.token = evt->status_req.token;
+      status_state.dirty = true;
       break;
     default:
       break;
@@ -409,9 +428,9 @@ static void status_task(void) {
     return;
   }
 
-  // The port must be enumerated; the DTR flag in the payload tells the host
-  // whether anybody has it open. (Asserting DTR is host dependent, so gating
-  // on it would mute the channel for hosts that never set it.)
+  // The bridge does not depend on the host asserting DTR: the CDC link counts
+  // as connected once the port is enumerated, so a status change or a query
+  // still gets answered on hosts that never set DTR.
   if (!usbfs_cdc_enumerated()) {
     return;
   }
@@ -425,6 +444,8 @@ static void status_task(void) {
   st.hid_itf_count = status_state.mounted ? 2 : 0;
   st.uptime_s      = (uint16_t)(now / 1000u);
   st.flags         = usbfs_cdc_connected() ? 0x01 : 0x00;  // bit0: DTR
+  st.leds          = kbd_led.known ? kbd_led.leds : 0;
+  st.token         = status_state.token;
 
   uint8_t        frame[BRIDGE_FRAME_LEN];
   const uint16_t header = BRIDGE_HDR_STATUS;
@@ -533,6 +554,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     kbd_led.leds = buffer[0];
     printf("[%lu] hid: leds num=%u caps=%u scroll=%u\r\n", (unsigned long) tusb_time_millis_api(),
            (buffer[0] >> 0) & 1u, (buffer[0] >> 1) & 1u, (buffer[0] >> 2) & 1u);
+    status_state.dirty = true;
   }
 }
 

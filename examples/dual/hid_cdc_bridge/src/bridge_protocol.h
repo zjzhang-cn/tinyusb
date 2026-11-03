@@ -41,7 +41,14 @@ extern "C" {
 #define BRIDGE_HDR_MOUSE_BUTTON   0x8457
 #define BRIDGE_HDR_MOUSE_REL_MOVE 0x8557
 #define BRIDGE_HDR_SYSTEM_KEY     0x8657
-#define BRIDGE_HDR_STATUS         0x8757  // device -> host only
+
+// Device -> host only. The parser never accepts it as an input header.
+#define BRIDGE_HDR_STATUS         0x8757
+
+// Host -> device: "report your state now". data[0] is a token the device echoes
+// in the status frame, so the host can match a reply to its query and notice a
+// dropped one.
+#define BRIDGE_HDR_STATUS_REQ     0x8758
 
 // System key codes, matching the HID system control usage array (1..3).
 #define BRIDGE_SYS_KEY_RELEASE    0
@@ -56,6 +63,7 @@ typedef enum {
   BRIDGE_EVT_MOUSE_BUTTON,
   BRIDGE_EVT_MOUSE_REL_MOVE,
   BRIDGE_EVT_SYSTEM_KEY,
+  BRIDGE_EVT_STATUS_REQ,
 } bridge_evt_type_t;
 
 typedef struct {
@@ -81,6 +89,11 @@ typedef struct {
   uint8_t reserved[7];
 } bridge_system_key_t;
 
+typedef struct {
+  uint8_t token;  // echoed in the status frame
+  uint8_t reserved[7];
+} bridge_status_req_t;
+
 // Device -> host status frame. Sent on every state change and once per second
 // as a heartbeat, so the host can tell whether the HID side is alive and what
 // power state the machine on that port is in.
@@ -95,7 +108,9 @@ typedef struct {
   uint8_t  hid_itf_count; // HID interfaces configured (0 or 2)
   uint16_t uptime_s;      // heartbeat counter, wraps every ~18 h
   uint8_t  flags;         // bit0: the CDC host has this port open (DTR)
-  uint8_t  reserved[3];
+  uint8_t  leds;          // keyboard LED bitmap (bit0 num, bit1 caps, bit2 scroll)
+  uint8_t  token;         // echoed from BRIDGE_HDR_STATUS_REQ
+  uint8_t  reserved;
 } bridge_status_t;
 
 typedef struct {
@@ -105,6 +120,7 @@ typedef struct {
     bridge_mouse_t      mouse;
     bridge_mouse_rel_t  mouse_rel;
     bridge_system_key_t system;
+    bridge_status_req_t status_req;
   };
 } bridge_evt_t;
 
@@ -112,6 +128,11 @@ typedef struct {
   uint8_t buf[BRIDGE_FRAME_LEN];
   uint8_t len;
 } bridge_parser_t;
+
+// Build a device -> host status frame. data[0] carries the keyboard LED bitmap
+// (bit0 num lock, bit1 caps lock, bit2 scroll lock, bit3 compose, bit4 kana);
+// the remaining payload bytes are reserved and zero.
+void bridge_build_status(uint8_t frame[BRIDGE_FRAME_LEN], uint8_t leds);
 
 void bridge_parser_init(bridge_parser_t *parser);
 

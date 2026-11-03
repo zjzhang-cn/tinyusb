@@ -19,7 +19,10 @@ import os
 import select
 import struct
 import sys
+import termios
+import threading
 import time
+import tty
 
 FRAME = struct.Struct("<H8sH")
 TAIL = 0x0900
@@ -28,6 +31,11 @@ HDR_MOUSE_MOVE = 0x8357
 HDR_MOUSE_BUTTON = 0x8457
 HDR_MOUSE_REL = 0x8557
 HDR_SYSTEM_KEY = 0x8657
+HDR_STATUS = 0x8757  # device -> host: data[0] = LED bitmap
+LED_NUM = 0x01
+LED_CAPS = 0x02
+LED_OFFSET = 7  # frame[2 + 5]: bridge_status_t.leds
+KEY_NUM_LOCK = 0x53  # HID usage, toggles the host's num lock
 
 SYS_POWER_DOWN = 1
 
@@ -131,6 +139,71 @@ class Evdev:
         os.close(self.fd)
 
 
+class StatusReader(threading.Thread):
+    """Collects device -> host status frames (header 0x8757) from the CDC port."""
+
+    def __init__(self, fd):
+        super().__init__(daemon=True)
+        self.fd = fd
+        self.buf = bytearray()
+        self.frames = []
+        self.stop = threading.Event()
+
+    def run(self):
+        while not self.stop.is_set():
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if not r:
+                continue
+            try:
+                data = os.read(self.fd, 256)
+            except OSError:
+                continue
+            self.buf += data
+            while len(self.buf) >= 12:
+                header = self.buf[0] | (self.buf[1] << 8)
+                tail = self.buf[10] | (self.buf[11] << 8)
+                if header == HDR_STATUS and tail == TAIL:
+                    self.frames.append(self.buf[LED_OFFSET])
+                    del self.buf[:12]
+                else:
+                    del self.buf[:1]
+
+    def wait_leds(self, mask, value, timeout=3.0):
+        """Wait for a status frame whose LED bits match mask==value."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            while self.frames:
+                leds = self.frames.pop(0)
+                if (leds & mask) == value:
+                    return leds
+            time.sleep(0.02)
+        return None
+
+    def wait_frame(self, timeout=3.0):
+        """LED bitmap of the next status frame, whatever it says."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.frames:
+                return self.frames.pop(0)
+            time.sleep(0.02)
+        return None
+
+
+def configure_port(fd):
+    """Put the tty in raw mode and turn off flow control.
+
+    Without this the tty keeps its default termios: IXON interprets 0x11/0x13
+    bytes inside the binary frames as XON/XOFF and stops delivering data, and
+    CRTSCTS can stall reads too. minicom does this for you; cat does not, which
+    is why `cat /dev/ttyACM1` appears to work and then goes silent.
+    """
+    tty.setraw(fd)
+    attrs = termios.tcgetattr(fd)
+    attrs[2] &= ~termios.CRTSCTS
+    attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def expect(cond, msg):
     print(("  PASS  " if cond else "  FAIL  ") + msg)
     return 0 if cond else 1
@@ -157,7 +230,10 @@ def main() -> int:
         print(f"system   : {system.path}")
 
     fd = os.open(cdc, os.O_RDWR | os.O_NOCTTY)
+    configure_port(fd)
     os.set_blocking(fd, False)
+    status = StatusReader(fd)
+    status.start()
     failures = 0
     try:
         # 1. keyboard: press 'a' (HID usage 0x04 -> Linux KEY_A == 30)
@@ -260,7 +336,27 @@ def main() -> int:
             if system:
                 system.grab(False)
 
-        # 7. resynchronisation: garbage in front of a valid frame
+        # 7. Lock-key state is reported back over CDC (status frame 0x8757),
+        #    using Num Lock: the host always has it on, so both the "on" and the
+        #    "off" state are exercised and each toggle must produce a frame.
+        print("num lock state reported back")
+        status.frames.clear()
+        os.write(fd, key_frame(0, [KEY_NUM_LOCK]))
+        time.sleep(0.2)
+        os.write(fd, key_frame(0, []))
+        first = status.wait_frame()
+        failures += expect(first is not None, f"status frame after num lock toggle (got {first})")
+
+        os.write(fd, key_frame(0, [KEY_NUM_LOCK]))
+        time.sleep(0.2)
+        os.write(fd, key_frame(0, []))
+        second = status.wait_frame()
+        failures += expect(second is not None, f"status frame after second toggle (got {second})")
+        if first is not None and second is not None:
+            failures += expect((first ^ second) & LED_NUM,
+                               f"num lock bit toggled (first=0x{first:02x} second=0x{second:02x})")
+
+        # 8. resynchronisation: garbage in front of a valid frame
         print("resync after garbage")
         if abs_mouse:
             abs_mouse.read(0.1)
@@ -270,6 +366,8 @@ def main() -> int:
             pos = {c: v for (t, c, v) in ev if t == EV_ABS}
             failures += expect(abs(pos.get(ABS_X, -1) - 8192) < 200, f"ABS_X ~8192 (got {pos.get(ABS_X)})")
     finally:
+        status.stop.set()
+        status.join(timeout=1.0)
         os.close(fd)
         for dev in (kbd, abs_mouse, rel_mouse, system):
             if dev:

@@ -11,7 +11,8 @@ static inline uint16_t rd16(const uint8_t *p) {
 
 static bool header_is_valid(uint16_t header) {
   return header == BRIDGE_HDR_KEYBOARD || header == BRIDGE_HDR_MOUSE_MOVE || header == BRIDGE_HDR_MOUSE_BUTTON ||
-         header == BRIDGE_HDR_MOUSE_REL_MOVE || header == BRIDGE_HDR_SYSTEM_KEY;
+         header == BRIDGE_HDR_MOUSE_REL_MOVE || header == BRIDGE_HDR_SYSTEM_KEY ||
+         header == BRIDGE_HDR_STATUS_REQ;
 }
 
 static bridge_evt_type_t header_to_evt(uint16_t header) {
@@ -26,6 +27,8 @@ static bridge_evt_type_t header_to_evt(uint16_t header) {
       return BRIDGE_EVT_MOUSE_REL_MOVE;
     case BRIDGE_HDR_SYSTEM_KEY:
       return BRIDGE_EVT_SYSTEM_KEY;
+    case BRIDGE_HDR_STATUS_REQ:
+      return BRIDGE_EVT_STATUS_REQ;
     default:
       return BRIDGE_EVT_NONE;
   }
@@ -37,6 +40,15 @@ static void drop_first_byte(bridge_parser_t *parser) {
   if (parser->len > 0) {
     memmove(parser->buf, parser->buf + 1, parser->len);
   }
+}
+
+void bridge_build_status(uint8_t frame[BRIDGE_FRAME_LEN], uint8_t leds) {
+  const uint16_t header = BRIDGE_HDR_STATUS;
+  const uint16_t tail   = BRIDGE_FRAME_TAIL;
+  memset(frame, 0, BRIDGE_FRAME_LEN);
+  memcpy(frame, &header, sizeof(header));
+  frame[2] = leds;
+  memcpy(frame + BRIDGE_FRAME_LEN - sizeof(tail), &tail, sizeof(tail));
 }
 
 void bridge_parser_init(bridge_parser_t *parser) {
@@ -73,6 +85,9 @@ bool bridge_parser_feed(bridge_parser_t *parser, uint8_t byte, bridge_evt_t *evt
         break;
       case BRIDGE_EVT_SYSTEM_KEY:
         memcpy(&evt->system, parser->buf + 2, sizeof(evt->system));
+        break;
+      case BRIDGE_EVT_STATUS_REQ:
+        memcpy(&evt->status_req, parser->buf + 2, sizeof(evt->status_req));
         break;
       case BRIDGE_EVT_MOUSE_REL_MOVE:
         memcpy(&evt->mouse_rel, parser->buf + 2, sizeof(evt->mouse_rel));
