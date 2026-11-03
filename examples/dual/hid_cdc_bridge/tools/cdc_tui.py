@@ -46,6 +46,8 @@ HDR_STATUS_REQ = 0x8758
 
 SYS_POWER, SYS_SLEEP, SYS_WAKE = 1, 2, 3
 
+BTN_LEFT, BTN_RIGHT = 0x01, 0x02
+
 STATE_NAMES = {0: "unmounted", 1: "active", 2: "suspended"}
 LED_NUM, LED_CAPS, LED_SCROLL = 0x01, 0x02, 0x04
 
@@ -88,6 +90,18 @@ def abs_frame(x, y, buttons=0, wheel=0):
 
 def rel_frame(dx, dy, wheel=0):
     return frame(HDR_MOUSE_REL, struct.pack("<Bbhhbb", 0, 0, dx, dy, wheel, 0))
+
+
+def button_frame(buttons):
+    # x/y are ignored for a button frame: the pointer must not jump on a click.
+    return frame(HDR_MOUSE_BTN, struct.pack("<Bbhhbb", buttons, 0, 0, 0, 0, 0))
+
+
+def click(link, buttons, name, hold=0.05):
+    """Press and release: a terminal cannot report a key release."""
+    link.send(button_frame(buttons), f"{name} down")
+    time.sleep(hold)
+    link.send(button_frame(0), f"{name} up")
 
 
 def system_frame(code):
@@ -248,6 +262,7 @@ MODE_NAMES = {MODE_COMMAND: "COMMAND", MODE_TYPING: "TYPING"}
 HELP_COMMAND = [
     ("Ctrl-]", "switch to TYPING (keys go to the target machine)"),
     ("Arrow keys", "relative mouse move (4 units)"),
+    ("[ / ]", "left / right mouse click"),
     ("m", "absolute mouse to screen centre"),
     ("w / s", "wheel up / wheel down"),
     ("c", "tap Caps Lock"),
@@ -400,6 +415,10 @@ def run_ui(stdscr, link):
             link.send(rel_frame(-4, 0), "rel -4,0")
         elif ch == curses.KEY_RIGHT:
             link.send(rel_frame(4, 0), "rel +4,0")
+        elif ch == ord("["):
+            click(link, BTN_LEFT, "left click")
+        elif ch == ord("]"):
+            click(link, BTN_RIGHT, "right click")
         elif ch in (ord("m"),):
             link.send(abs_frame(2048, 2048), "abs 2048,2048")
         elif ch == ord("w"):

@@ -173,7 +173,7 @@ Two modes, switched with a single key (nothing is typed on a command line):
 
 | mode | what a key does | how to get there |
 |---|---|---|
-| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `m` absolute centre, `w`/`s` wheel, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `Ctrl-]` |
+| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `[` / `]` left / right click, `m` absolute centre, `w`/`s` wheel, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `Ctrl-]` |
 | `TYPING` | the key is forwarded to the machine on the HID port: letters, capitals (shift is added), digits, punctuation, Enter / Tab / Space / Backspace, arrow keys. Hotkeys are off here, so `m`, `w`, `q` are typed instead of commanding | `Ctrl-]`; leave with `Ctrl-]` or `Esc` |
 
 The current mode is in the title bar, and the key list on the right always
