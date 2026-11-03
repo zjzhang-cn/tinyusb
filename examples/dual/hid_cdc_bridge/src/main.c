@@ -83,8 +83,68 @@ static struct {
   uint8_t code;
 } sys_state;
 
+// Reported to the host over the CDC port: what the machine on the HID side is
+// doing (enumerated / suspended / gone) plus a heartbeat.
+static struct {
+  bool     mounted;
+  bool     suspended;
+  bool     dirty;
+  uint32_t last_ms;
+} status_state = {.dirty = true};
+
 static uint32_t        blink_interval_ms = 250;
 static bridge_parser_t parser;
+
+//--------------------------------------------------------------------+
+// Diagnostics (USART1 @115200, independent of the CDC control channel)
+//--------------------------------------------------------------------+
+
+#define LOG_PERIOD_MS 5000
+
+static struct {
+  uint32_t events;      // frames parsed from CDC
+  uint32_t reports;     // HID reports actually queued
+  uint32_t bad_frame;   // parser re-syncs
+  bool mounted;
+  bool suspended;
+  bool dtr;
+  bool wake_logged;
+  uint32_t next_ms;
+} log_state;
+
+static void log_event(const char* what) {
+  printf("[%lu] %s\r\n", (unsigned long) tusb_time_millis_api(), what);
+}
+
+static void log_task(void) {
+  const bool mounted = tud_mounted();
+  const bool suspended = tud_suspended();
+  const bool dtr = usbfs_cdc_connected();
+  const uint32_t now = tusb_time_millis_api();
+
+  if (mounted != log_state.mounted) {
+    log_state.mounted = mounted;
+    log_event(mounted ? "hid: mounted" : "hid: unmounted");
+  }
+  if (suspended != log_state.suspended) {
+    log_state.suspended = suspended;
+    log_state.wake_logged = false;
+    log_event(suspended ? "hid: bus suspend" : "hid: bus resume");
+  }
+  if (dtr != log_state.dtr) {
+    log_state.dtr = dtr;
+    log_event(dtr ? "cdc: host opened port (DTR)" : "cdc: host closed port");
+  }
+
+  if ((int32_t) (now - log_state.next_ms) >= 0) {
+    log_state.next_ms = now + LOG_PERIOD_MS;
+    printf("[%lu] stats: frames=%lu reports=%lu bad=%lu hid=%s cdc=%s\r\n",
+           (unsigned long) now, (unsigned long) log_state.events,
+           (unsigned long) log_state.reports, (unsigned long) log_state.bad_frame,
+           suspended ? "suspended" : (mounted ? "mounted" : "detached"),
+           dtr ? "open" : "closed");
+  }
+}
 
 //--------------------------------------------------------------------+
 // Helpers
@@ -215,6 +275,7 @@ static void cdc_rx_task(void) {
     for (uint32_t i = 0; i < count; i++) {
       bridge_evt_t evt;
       if (bridge_parser_feed(&parser, buf[i], &evt)) {
+        log_state.events++;
         handle_event(&evt);
       }
     }
@@ -236,6 +297,10 @@ static void hid_ext_tx_task(void) {
   if (sys_state.press_pending) {
     const uint8_t report = sys_state.code;
     if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_SYSTEM, &report, sizeof(report))) {
+      log_state.reports++;
+      log_event(sys_state.code == BRIDGE_SYS_KEY_POWER_DOWN ? "hid: system key power down"
+                : sys_state.code == BRIDGE_SYS_KEY_SLEEP    ? "hid: system key sleep"
+                                                            : "hid: system key wake up");
       sys_state.press_pending   = false;
       sys_state.release_pending = true;
     }
@@ -245,6 +310,7 @@ static void hid_ext_tx_task(void) {
   if (sys_state.release_pending) {
     const uint8_t report = 0;
     if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_SYSTEM, &report, sizeof(report))) {
+      log_state.reports++;
       sys_state.release_pending = false;
     }
     return;
@@ -263,6 +329,7 @@ static void hid_ext_tx_task(void) {
   report[4] = (uint8_t)rel_state.pan;
 
   if (tud_hid_n_report(HID_INSTANCE_EXT, REPORT_ID_MOUSE_REL, report, sizeof(report))) {
+    log_state.reports++;
     rel_state.dx -= dx;
     rel_state.dy -= dy;
     rel_state.wheel = 0;
@@ -282,6 +349,7 @@ static void hid_main_tx_task(void) {
 
   if (kbd_state.dirty) {
     if (tud_hid_n_report(HID_INSTANCE_MAIN, REPORT_ID_KEYBOARD, kbd_state.buf, sizeof(kbd_state.buf))) {
+      log_state.reports++;
       kbd_state.dirty = false;
     }
     return;
@@ -298,6 +366,7 @@ static void hid_main_tx_task(void) {
   report[6] = (uint8_t)mouse_state.pan;
 
   if (tud_hid_n_report(HID_INSTANCE_MAIN, REPORT_ID_MOUSE, report, sizeof(report))) {
+    log_state.reports++;
     mouse_state.dirty = false;
     mouse_state.wheel = 0;
     mouse_state.pan   = 0;
@@ -312,12 +381,54 @@ static void hid_tx_task(void) {
   }
 
   if (tud_suspended()) {
+    if (!log_state.wake_logged) {
+      log_state.wake_logged = true;
+      log_event("hid: pending report -> remote wakeup");
+    }
     tud_remote_wakeup();
     return;
   }
 
   hid_ext_tx_task();  // system keys and relative pointer first
   hid_main_tx_task(); // keyboard, then absolute pointer
+}
+
+// Push a status frame on every state change and once per second. Only when the
+// host has the CDC port open, so nothing queues up while nobody listens.
+static void status_task(void) {
+  const uint32_t now = tusb_time_millis_api();
+  if (!status_state.dirty && (now - status_state.last_ms) < 1000u) {
+    return;
+  }
+
+  // The port must be enumerated; the DTR flag in the payload tells the host
+  // whether anybody has it open. (Asserting DTR is host dependent, so gating
+  // on it would mute the channel for hosts that never set it.)
+  if (!usbfs_cdc_enumerated()) {
+    return;
+  }
+
+  bridge_status_t st;
+  memset(&st, 0, sizeof(st));
+  st.state = status_state.mounted ? (status_state.suspended ? BRIDGE_STATE_SUSPENDED : BRIDGE_STATE_ACTIVE)
+                                  : BRIDGE_STATE_UNMOUNTED;
+  // Both HID interfaces come from the same configuration, so they are either
+  // both configured (device configured) or neither.
+  st.hid_itf_count = status_state.mounted ? 2 : 0;
+  st.uptime_s      = (uint16_t)(now / 1000u);
+  st.flags         = usbfs_cdc_connected() ? 0x01 : 0x00;  // bit0: DTR
+
+  uint8_t        frame[BRIDGE_FRAME_LEN];
+  const uint16_t header = BRIDGE_HDR_STATUS;
+  const uint16_t tail   = BRIDGE_FRAME_TAIL;
+  memcpy(frame, &header, sizeof(header));
+  memcpy(frame + 2, &st, sizeof(st));
+  memcpy(frame + BRIDGE_FRAME_LEN - 2, &tail, sizeof(tail));
+
+  if (usbfs_cdc_write(frame, sizeof(frame)) == sizeof(frame)) {
+    status_state.dirty   = false;
+    status_state.last_ms = now;
+  }
 }
 
 static void led_blinking_task(void) {
@@ -357,6 +468,8 @@ int main(void) {
     usbfs_cdc_task(); // CDC transmit pump (port 1)
     cdc_rx_task();    // CDC -> HID
     hid_tx_task();    // pending HID reports
+    status_task();    // HID port state -> CDC
+    log_task();
     led_blinking_task();
   }
 }
@@ -366,20 +479,30 @@ int main(void) {
 //--------------------------------------------------------------------+
 
 void tud_mount_cb(void) {
-  blink_interval_ms = 1000;
+  blink_interval_ms      = 1000;
+  status_state.mounted   = true;
+  status_state.suspended = false;
+  status_state.dirty     = true;
 }
 
 void tud_umount_cb(void) {
-  blink_interval_ms = 250;
+  blink_interval_ms      = 250;
+  status_state.mounted   = false;
+  status_state.suspended = false;
+  status_state.dirty     = true;
 }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
   (void)remote_wakeup_en;
-  blink_interval_ms = 2500;
+  blink_interval_ms      = 2500;
+  status_state.suspended = true;
+  status_state.dirty     = true;
 }
 
 void tud_resume_cb(void) {
-  blink_interval_ms = tud_mounted() ? 1000 : 250;
+  blink_interval_ms      = tud_mounted() ? 1000 : 250;
+  status_state.suspended = false;
+  status_state.dirty     = true;
 }
 
 // Invoked when received SET_REPORT control request or data received on OUT endpoint

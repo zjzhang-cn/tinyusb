@@ -11,6 +11,7 @@
  *   header 0x8457 -> mouse button (button, reserved, ...)
  *   header 0x8557 -> mouse move, relative (button, reserved, dx, dy, wheel, pan)
  *   header 0x8657 -> system key (power down / sleep / wake up)
+ *   header 0x8757 -> status, device -> host only (state of the HID port)
  *   tail   0x0900
  *
  * The first three headers are the ones the previous ESP32 based product used;
@@ -40,6 +41,7 @@ extern "C" {
 #define BRIDGE_HDR_MOUSE_BUTTON   0x8457
 #define BRIDGE_HDR_MOUSE_REL_MOVE 0x8557
 #define BRIDGE_HDR_SYSTEM_KEY     0x8657
+#define BRIDGE_HDR_STATUS         0x8757  // device -> host only
 
 // System key codes, matching the HID system control usage array (1..3).
 #define BRIDGE_SYS_KEY_RELEASE    0
@@ -78,6 +80,23 @@ typedef struct {
   uint8_t code; // BRIDGE_SYS_KEY_*
   uint8_t reserved[7];
 } bridge_system_key_t;
+
+// Device -> host status frame. Sent on every state change and once per second
+// as a heartbeat, so the host can tell whether the HID side is alive and what
+// power state the machine on that port is in.
+typedef enum {
+  BRIDGE_STATE_UNMOUNTED = 0, // powered off, cable out, or not enumerated
+  BRIDGE_STATE_ACTIVE = 1,    // enumerated and the bus is active
+  BRIDGE_STATE_SUSPENDED = 2, // the target suspended the bus (S3)
+} bridge_state_t;
+
+typedef struct {
+  uint8_t  state;         // BRIDGE_STATE_*
+  uint8_t  hid_itf_count; // HID interfaces configured (0 or 2)
+  uint16_t uptime_s;      // heartbeat counter, wraps every ~18 h
+  uint8_t  flags;         // bit0: the CDC host has this port open (DTR)
+  uint8_t  reserved[3];
+} bridge_status_t;
 
 typedef struct {
   bridge_evt_type_t type;

@@ -37,6 +37,10 @@ uint32_t usbfs_cdc_write(const void *buf, uint32_t len);
 // True when the host has the port open (DTR asserted).
 bool usbfs_cdc_connected(void);
 
+// True when the device is enumerated (configured), whether or not the host has
+// the port open.
+bool usbfs_cdc_enumerated(void);
+
 // Interrupt hook installed over the weak usbfs_isr_hook() in the BSP.
 void usbfs_isr_hook(void);
 
