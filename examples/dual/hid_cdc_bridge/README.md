@@ -151,6 +151,29 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | `src/usbfs_cdc.c` | CDC-ACM on the second controller, ring buffers |
 | `tools/bridge_check.py` | host-side acceptance test (Linux, needs `input` group) |
 
+## Host suspend vs unplug
+
+The CH32V203 FSDev controller has no VBUS sensing, and its DCD says so
+(`src/portable/st/stm32_fsdev/dcd_stm32_fsdev.c`: suspend is asserted for both
+suspend and unplug, so only suspend is reported). Consequence, measured with a
+host that goes to sleep:
+
+```
+_usbd_dev.suspended = 1, cfg_num = 1, remote_wakeup_en = 1
+blink_interval_ms   = 2500          # tud_suspend_cb(), not tud_umount_cb()
+```
+
+- A sleeping host gives `tud_suspend_cb()`; `tud_mounted()` stays true and
+  `tud_umount_cb()` is never called.
+- Unplugging the cable or powering the host off gives the same suspend event,
+  not an unmount, so the application cannot tell them apart either.
+- Because the host enabled remote wakeup, any frame injected while it sleeps
+  raises `tud_remote_wakeup()` and pulls the bus out of suspend.
+
+Getting a real unmount would mean driving the HID role from the USBFS
+controller (`USBFS_SR_VBUS_VLD`) instead of FSDev, or adding an SOF-timeout
+check in the application.
+
 ## Limits
 
 - Keyboard is 6-key rollover (`TUD_HID_REPORT_DESC_KEYBOARD`), no NKRO.
