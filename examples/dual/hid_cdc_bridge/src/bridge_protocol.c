@@ -42,15 +42,6 @@ static void drop_first_byte(bridge_parser_t *parser) {
   }
 }
 
-void bridge_build_status(uint8_t frame[BRIDGE_FRAME_LEN], uint8_t leds) {
-  const uint16_t header = BRIDGE_HDR_STATUS;
-  const uint16_t tail   = BRIDGE_FRAME_TAIL;
-  memset(frame, 0, BRIDGE_FRAME_LEN);
-  memcpy(frame, &header, sizeof(header));
-  frame[2] = leds;
-  memcpy(frame + BRIDGE_FRAME_LEN - sizeof(tail), &tail, sizeof(tail));
-}
-
 void bridge_parser_init(bridge_parser_t *parser) {
   parser->len = 0;
 }

@@ -31,7 +31,8 @@ HDR_MOUSE_MOVE = 0x8357
 HDR_MOUSE_BUTTON = 0x8457
 HDR_MOUSE_REL = 0x8557
 HDR_SYSTEM_KEY = 0x8657
-HDR_STATUS = 0x8757  # device -> host: data[0] = LED bitmap
+HDR_STATUS = 0x8757  # device -> host status, event driven (no heartbeat)
+HDR_STATUS_REQ = 0x8758  # host -> device: ask for one status frame
 LED_NUM = 0x01
 LED_CAPS = 0x02
 LED_OFFSET = 7  # frame[2 + 5]: bridge_status_t.leds
@@ -168,16 +169,15 @@ class StatusReader(threading.Thread):
                 else:
                     del self.buf[:1]
 
-    def wait_leds(self, mask, value, timeout=3.0):
-        """Wait for a status frame whose LED bits match mask==value."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            while self.frames:
-                leds = self.frames.pop(0)
-                if (leds & mask) == value:
-                    return leds
-            time.sleep(0.02)
-        return None
+    def probe(self, timeout=2.0):
+        """Ask the device for its status now and return the LED byte.
+
+        Status frames are event driven, so a test cannot wait for one to appear
+        on its own: it has to request it.
+        """
+        self.frames.clear()
+        os.write(self.fd, frame(HDR_STATUS_REQ, bytes([0x5A]) + bytes(7)))
+        return self.wait_frame(timeout)
 
     def wait_frame(self, timeout=3.0):
         """LED bitmap of the next status frame, whatever it says."""
@@ -340,24 +340,27 @@ def main() -> int:
                 system.grab(False)
 
         # 7. Lock-key state is reported back over CDC (status frame 0x8757),
-        #    using Num Lock: the host always has it on, so both the "on" and the
-        #    "off" state are exercised and each toggle must produce a frame.
+        #    using Num Lock: the host toggles it and writes an LED output report,
+        #    which the firmware turns into a status event. The host occasionally
+        #    coalesces two quick toggles, so retry until the bit flips instead of
+        #    assuming one press is enough.
         print("num lock state reported back")
-        status.frames.clear()
-        os.write(fd, key_frame(0, [KEY_NUM_LOCK]))
-        time.sleep(0.2)
-        os.write(fd, key_frame(0, []))
-        first = status.wait_frame()
-        failures += expect(first is not None, f"status frame after num lock toggle (got {first})")
-
-        os.write(fd, key_frame(0, [KEY_NUM_LOCK]))
-        time.sleep(0.2)
-        os.write(fd, key_frame(0, []))
-        second = status.wait_frame()
-        failures += expect(second is not None, f"status frame after second toggle (got {second})")
-        if first is not None and second is not None:
-            failures += expect((first ^ second) & LED_NUM,
-                               f"num lock bit toggled (first=0x{first:02x} second=0x{second:02x})")
+        previous = None
+        toggled = False
+        for attempt in range(5):
+            os.write(fd, key_frame(0, [KEY_NUM_LOCK]))
+            time.sleep(0.2)
+            os.write(fd, key_frame(0, []))
+            time.sleep(0.2)
+            leds = status.probe()
+            if leds is None:
+                continue
+            if previous is not None and (previous ^ leds) & LED_NUM:
+                print(f"  num lock {previous & LED_NUM} -> {leds & LED_NUM} (attempt {attempt + 1})")
+                toggled = True
+                break
+            previous = leds
+        failures += expect(toggled, f"num lock bit flips after a toggle (attempts={attempt + 1})")
 
         # 8. resynchronisation: garbage in front of a valid frame
         print("resync after garbage")

@@ -111,16 +111,21 @@ garbage bytes cost at most one frame.
 
 The reverse direction carries status only. A 12-byte `0x8757` frame is sent when
 something changes (keyboard LED state, the host power state, DTR/RTS) and when
-the host asks with `0x8758`, whose `token` byte is echoed back. There is **no
-heartbeat**, so a quiet link is normal; a host that wants the current state
-sends the query (measured round trip: ~0.1 ms).
+the host asks with `0x8758`, whose `token` byte is echoed back. Opening or
+closing the port counts as a change too (DTR edge), and so does the port
+appearing for the first time, so a fresh reader always gets one frame at once.
+
+There is **no heartbeat**: nothing is sent while nothing happens, so a quiet
+link is normal and `uptime` is a timestamp of the last event rather than a
+liveness counter. A host that wants the current state sends the query
+(measured round trip: ~0.1 ms).
 
 | offset | size | field |
 |---|---|---|
 | 0 | 2 | header `0x8757` (`57 87`) |
 | 2 | 1 | state: 0 unmounted, 1 active, 2 suspended |
 | 3 | 1 | HID interfaces configured (0 or 2) |
-| 4 | 2 | uptime seconds, wraps every ~18 h |
+| 4 | 2 | uptime seconds at the moment the frame was built (wraps ~18 h) |
 | 6 | 1 | flags: bit0 = DTR, bit1 = RTS, as set by the host |
 | 7 | 1 | keyboard LEDs: bit0 num, bit1 caps, bit2 scroll |
 | 8 | 1 | token, echoed from the query |

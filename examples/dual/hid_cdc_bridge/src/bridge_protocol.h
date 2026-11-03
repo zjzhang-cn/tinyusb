@@ -107,7 +107,7 @@ typedef enum {
 typedef struct {
   uint8_t  state;         // BRIDGE_STATE_*
   uint8_t  hid_itf_count; // HID interfaces configured (0 or 2)
-  uint16_t uptime_s;      // seconds since boot, wraps every ~18 h
+  uint16_t uptime_s;      // seconds since boot when this frame was built
   uint8_t  flags;         // bit0: DTR (host opened the port), bit1: RTS
   uint8_t  leds;          // keyboard LED bitmap (bit0 num, bit1 caps, bit2 scroll)
   uint8_t  token;         // echoed from BRIDGE_HDR_STATUS_REQ
@@ -129,11 +129,6 @@ typedef struct {
   uint8_t buf[BRIDGE_FRAME_LEN];
   uint8_t len;
 } bridge_parser_t;
-
-// Build a device -> host status frame. data[0] carries the keyboard LED bitmap
-// (bit0 num lock, bit1 caps lock, bit2 scroll lock, bit3 compose, bit4 kana);
-// the remaining payload bytes are reserved and zero.
-void bridge_build_status(uint8_t frame[BRIDGE_FRAME_LEN], uint8_t leds);
 
 void bridge_parser_init(bridge_parser_t *parser);
 

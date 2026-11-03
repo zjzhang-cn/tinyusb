@@ -385,7 +385,7 @@ def handle_command(link, cmd):
 
 def selftest(link):
     print(f"port: {link.path}")
-    time.sleep(1.0)  # let the reader (and the bridge's heartbeat) start
+    time.sleep(0.5)  # let the reader thread start
 
     steps = [
         ("keyboard 'a'", [key_frame(0, 0x04), key_release()]),
@@ -395,14 +395,19 @@ def selftest(link):
     ]
     failures = 0
     for name, frames in steps:
-        before = link.rx_frames
         for f in frames:
             link.send(f, name)
-        deadline = time.time() + 5.0
+        # The bridge sends status frames only on events, so probe it: a reply
+        # proves both that the input frame was written and that the IN channel
+        # still answers.
+        time.sleep(0.05)
+        before = link.rx_frames
+        link.query()
+        deadline = time.time() + 3.0
         while time.time() < deadline and link.rx_frames == before:
-            time.sleep(0.05)
+            time.sleep(0.02)
         got = link.rx_frames > before
-        print(f"  {'PASS' if got else 'FAIL'}  {name}: status frame {'received' if got else 'missing'}")
+        print(f"  {'PASS' if got else 'FAIL'}  {name}: status query {'answered' if got else 'unanswered'}")
         failures += 0 if got else 1
 
     print(f"  tx={link.tx_frames} rx={link.rx_frames}")

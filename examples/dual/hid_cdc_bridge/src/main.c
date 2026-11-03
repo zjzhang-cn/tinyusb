@@ -84,13 +84,15 @@ static struct {
 } sys_state;
 
 // Reported to the host over the CDC port: what the machine on the HID side is
-// doing (enumerated / suspended / gone) plus a heartbeat.
+// doing (enumerated / suspended / gone). Only state changes are reported, so
+// this also remembers what the host was last told.
 static struct {
   bool     mounted;
   bool     suspended;
   bool     dirty;
-  uint8_t  token;  // echoed from the host's status query
-  uint32_t last_ms;
+  bool     cdc_seen;        // the CDC port has been enumerated at least once
+  uint8_t  token;           // echoed from the host's status query
+  uint8_t  reported_flags;  // last DTR/RTS byte sent, to notice an edge
 } status_state = {.dirty = true};
 
 // Keyboard LED state reported by the host (output report): bit0 num lock,
@@ -119,14 +121,6 @@ static struct {
   bool wake_logged;
   uint32_t next_ms;
 } log_state;
-
-// Device -> host status frame: the LED bitmap, so the controlling PC can show
-// Caps Lock state without a second channel.
-static void cdc_send_status(void) {
-  uint8_t frame[BRIDGE_FRAME_LEN];
-  bridge_build_status(frame, kbd_led.leds);
-  usbfs_cdc_write(frame, sizeof(frame));
-}
 
 static void log_event(const char* what) {
   printf("[%lu] %s\r\n", (unsigned long) tusb_time_millis_api(), what);
@@ -164,7 +158,6 @@ static void log_task(void) {
            (unsigned long) usbfs_dbg_tx_arms, (unsigned long) usbfs_dbg_tx_done,
            (unsigned long) usbfs_dbg_tx_stuck, (unsigned long) usbfs_dbg_tx_timeout,
            (unsigned long) usbfs_dbg_isr_other);
-    cdc_send_status();  // heartbeat so a reconnecting host learns the LED state
   }
 }
 
@@ -420,20 +413,32 @@ static void hid_tx_task(void) {
   hid_main_tx_task(); // keyboard, then absolute pointer
 }
 
-// Push a status frame on every state change and once per second. Only when the
-// host has the CDC port open, so nothing queues up while nobody listens.
+// Push a status frame on every state change, and only on a state change: the
+// host asks for the current state with BRIDGE_HDR_STATUS_REQ, so no timer is
+// needed and the IN endpoint stays idle while nothing happens.
 static void status_task(void) {
-  const uint32_t now = tusb_time_millis_api();
-  if (!status_state.dirty && (now - status_state.last_ms) < 1000u) {
+  const uint8_t line       = usbfs_cdc_line_state();  // bit0 DTR, bit1 RTS
+  const bool    enumerated = usbfs_cdc_enumerated();
+
+  // The host touching DTR or RTS is an event too (it is how opening the port
+  // becomes visible), as is the CDC port appearing for the first time.
+  if (line != status_state.reported_flags) {
+    status_state.reported_flags = line;
+    status_state.dirty          = true;
+  }
+  if (enumerated && !status_state.cdc_seen) {
+    status_state.cdc_seen = true;
+    status_state.dirty    = true;
+  }
+
+  if (!status_state.dirty || !enumerated) {
     return;
   }
 
   // The bridge does not depend on the host asserting DTR: the CDC link counts
   // as connected once the port is enumerated, so a status change or a query
   // still gets answered on hosts that never set DTR.
-  if (!usbfs_cdc_enumerated()) {
-    return;
-  }
+  const uint32_t now = tusb_time_millis_api();
 
   bridge_status_t st;
   memset(&st, 0, sizeof(st));
@@ -443,7 +448,7 @@ static void status_task(void) {
   // both configured (device configured) or neither.
   st.hid_itf_count = status_state.mounted ? 2 : 0;
   st.uptime_s      = (uint16_t)(now / 1000u);
-  st.flags         = usbfs_cdc_line_state();  // bit0: DTR, bit1: RTS
+  st.flags         = line;  // bit0: DTR, bit1: RTS
   st.leds          = kbd_led.known ? kbd_led.leds : 0;
   st.token         = status_state.token;
 
@@ -454,9 +459,10 @@ static void status_task(void) {
   memcpy(frame + 2, &st, sizeof(st));
   memcpy(frame + BRIDGE_FRAME_LEN - 2, &tail, sizeof(tail));
 
+  // On a full ring the frame is simply retried on the next pass: the host is
+  // not reading, and it will ask for the state again when it cares.
   if (usbfs_cdc_write(frame, sizeof(frame)) == sizeof(frame)) {
-    status_state.dirty   = false;
-    status_state.last_ms = now;
+    status_state.dirty = false;
   }
 }
 
@@ -547,8 +553,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     return;
   }
 
-  // The CDC channel is write-only towards the device, so the LED state is
-  // only kept here and printed on the UART log.
+  // Keep the LED state and tell the host: a new bitmap is a status event.
   if (!kbd_led.known || kbd_led.leds != buffer[0]) {
     kbd_led.known = true;
     kbd_led.leds = buffer[0];
