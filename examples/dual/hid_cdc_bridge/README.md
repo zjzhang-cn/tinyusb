@@ -197,10 +197,17 @@ pump rewrites were spent on it before the termios setting was found. Bisecting
 the branch later showed every firmware version from the DCD switch onwards
 works with a raw-mode reader.
 
-`tools/cdc_tui.py` and `tools/bridge_check.py` already do this. The full story,
-and the one device-side rule that still matters (a frame armed while the host
-stops reading is retired by the 1 s safety valve), is written up in
-[CDC-IN-INVESTIGATION.md](CDC-IN-INVESTIGATION.md).
+`tools/cdc_tui.py` and `tools/bridge_check.py` already do this.
+
+### Device-side note: a status frame is a short packet
+
+The CDC data IN endpoint has a 64-byte max packet and a status frame is 12
+bytes, so the controller only reports the transfer as complete when the host
+issues one more IN token. The pump therefore stays serialized on that
+completion (it never re-arms over a live transfer), and a 1 s safety valve
+retires a frame whose host has stopped reading, so the endpoint cannot stay
+pending forever. A host that reads in raw mode completes a frame in
+milliseconds and never trips the valve.
 
 ## Limits
 
