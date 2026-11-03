@@ -1,23 +1,33 @@
 # CDC device → host: the "unreliable IN channel" was a host termios trap
 
 Status: **resolved**. The bridge's device → host path works. The failures that
-looked like a firmware problem came from the host side: a tty opened with its
-default termios enables software flow control (`IXON`), and a `0x13` byte inside
-a binary frame is then treated as XOFF, which stops delivery until a `0x11`
-(XON) happens to arrive. `CRTSCTS` and `ICRNL` make it worse.
+looked like a firmware problem came from the host side: a tty keeps its default
+termios, i.e. **canonical mode**, and `read()` in canonical mode only returns at
+a line delimiter. A binary frame rarely contains one, so the reader blocks after
+whatever partial burst it got and appears dead.
 
-`minicom` sets raw mode on open, so it always worked; `cat` does not, so it
-"works for a while and then goes silent" — exactly the symptom that sent this
-investigation down a firmware rabbit hole.
+`minicom` puts the port in raw mode on open, so it always worked; `cat` does
+not, so it "works for a while and then goes silent" — exactly the symptom that
+sent this investigation down a firmware rabbit hole.
+
+Flow control is *not* the cause: disabling `IXON`/`CRTSCTS` alone changes
+nothing (measured below).
 
 ## Evidence
 
-Same board, same firmware, only the host's serial settings changed:
+Same board, same firmware, only the host's serial settings changed (`cat` for
+5 s each):
 
-| Host termios | Bytes received in 10 s |
+| Host termios | Bytes received |
 |---|---|
-| `raw -ixon -ixoff -crtscts` | **144** (12 status frames) |
-| default (`stty sane`) | **0** |
+| `sane` (default, canonical) | 0 |
+| `sane -ixon` | 0 |
+| `sane -crtscts` | 0 |
+| `sane -ixon -crtscts` (all flow control off) | 0 |
+| **`sane -icanon`** (flow control still on) | **72** |
+| `raw -crtscts` / `raw -ixon` | 72 |
+
+Canonical mode is the blocker; flow control has no visible effect.
 
 With raw mode, the host-initiated query answers every time:
 
@@ -31,14 +41,14 @@ was always arming and completing the transfers.
 
 ## Why the earlier measurements looked like a firmware bug
 
-`uptime_s` in the status frame increments once per second, so its low byte
-walks through every value, including `0x13` (XOFF) and `0x11` (XON). A `cat`
-that starts reading right after a reset therefore shows data until the first
-`0x13` lands in the stream, then nothing — which reads exactly like "the
-channel dies after a few seconds". Repeated open/close cycles only changed
-where in that cycle the observation started.
+A canonical-mode reader returns up to the next line delimiter. Our frames are
+binary, so a delimiter (`0x0A`) shows up only when some payload byte happens to
+be one — the `uptime_s` low byte walks through every value once per second. A
+`cat` that starts reading after a reset therefore emits a burst when a `0x0A`
+goes by, then blocks for an arbitrary time, which reads exactly like "the
+channel dies after a few seconds".
 
-Every "0/N" result in this log was taken through a reader without raw mode.
+Every "0/N" result in this log was taken through a reader in canonical mode.
 
 ## The one real device-side constraint (still valid)
 
@@ -66,12 +76,16 @@ normal use.
 Any program that opens the CDC port for binary data must:
 
 ```python
-tty.setraw(fd)                              # no ICANON/ICRNL/OPOST
+tty.setraw(fd)          # the important part: clears ICANON (and ICRNL/OPOST,
+                        # which would turn 0x0D into 0x0A and corrupt frames)
 attrs = termios.tcgetattr(fd)
-attrs[2] &= ~termios.CRTSCTS                # no hardware flow control
-attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)   # no XON/XOFF
+attrs[2] &= ~termios.CRTSCTS                                  # optional
+attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)    # optional
 termios.tcsetattr(fd, termios.TCSANOW, attrs)
 ```
+
+`-icanon` alone is enough (measured); the flow-control bits are defensive, for
+hosts whose defaults differ.
 
 `tools/cdc_tui.py` and `tools/bridge_check.py` do this in `configure_port()`.
 `minicom` does it internally. `cat`, `screen` with default settings, and most
@@ -122,7 +136,7 @@ cd examples/dual/hid_cdc_bridge
 make BOARD=nanoch32v203 all && wlink flash _build/nanoch32v203/hid_cdc_bridge.elf && wlink reset
 
 # raw-mode reader (the tools do this themselves)
-stty -F /dev/ttyACM1 raw -crtscts -ixon
+stty -F /dev/ttyACM1 raw -crtscts -ixon    # -icanon is what actually matters
 ./tools/cdc_tui.py --selftest          # 4 checks
 ./tools/bridge_check.py /dev/ttyACM1   # 25 checks (needs the HID cable on this PC)
 

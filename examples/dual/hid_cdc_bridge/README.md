@@ -176,11 +176,12 @@ check in the application.
 
 ## Host-side serial settings
 
-The CDC link carries binary frames, so the host tool must open the port in raw
-mode with flow control off (`IXON`/`IXOFF`/`CRTSCTS`). Otherwise a `0x13` byte
-inside a frame is taken as XOFF and the tty silently stops delivering data —
-`cat /dev/ttyACM1` shows output for a while and then goes quiet, while
-`minicom` works because it sets raw mode itself.
+The CDC link carries binary frames, so the host tool must take the port out of
+**canonical mode** (raw mode). In canonical mode `read()` only returns at a
+line delimiter, which a binary frame almost never contains, so the tty appears
+to stall: `cat /dev/ttyACM1` shows a burst and then goes quiet, while `minicom`
+works because it sets raw mode itself. Disabling flow control alone does not
+help; `-icanon` is what matters (measured, see the post-mortem).
 
 ```python
 tty.setraw(fd)                                   # no ICANON / ICRNL / OPOST

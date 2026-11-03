@@ -192,10 +192,13 @@ class StatusReader(threading.Thread):
 def configure_port(fd):
     """Put the tty in raw mode and turn off flow control.
 
-    Without this the tty keeps its default termios: IXON interprets 0x11/0x13
-    bytes inside the binary frames as XON/XOFF and stops delivering data, and
-    CRTSCTS can stall reads too. minicom does this for you; cat does not, which
-    is why `cat /dev/ttyACM1` appears to work and then goes silent.
+    Raw mode is the part that matters: it clears ICANON, and a canonical-mode
+    read only returns at a line delimiter, so a binary frame stream stalls after
+    a burst. It also clears ICRNL/OPOST, which would rewrite 0x0D as 0x0A inside
+    frames. Flow control (IXON/CRTSCTS) made no difference when measured, but is
+    cleared for hosts with different defaults. minicom does the raw part for
+    you; cat does not, which is why `cat /dev/ttyACM1` appears to work and then
+    goes silent.
     """
     tty.setraw(fd)
     attrs = termios.tcgetattr(fd)
