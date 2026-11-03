@@ -2,9 +2,12 @@
 """
 Interactive (curses) terminal for manually exercising the HID CDC bridge.
 
-Type on the keyboard shown in the TUI and the machine attached to the bridge's
-HID port receives the keystrokes; mouse/system commands are single keys. Every
-status frame the bridge sends back is decoded in the log pane.
+Two modes, switched with a single key (F1, or Esc from typing mode):
+
+  COMMAND  every key is a hotkey (mouse, wheel, system keys, status query, ...)
+  TYPING   every key is forwarded to the machine on the HID port
+
+Every status frame the bridge sends back is decoded in the log pane.
 
 Usage:
   ./cdc_tui.py                 # auto-detect the CDC port (cafe:4001)
@@ -236,16 +239,20 @@ class Link:
 # curses UI
 # ---------------------------------------------------------------------------
 
-HELP = [
-    ("a-z 0-9 / punctuation", "type on the target machine"),
-    ("Enter  Tab  Space  Backspace", "as labelled"),
+MODE_COMMAND, MODE_TYPING = 0, 1
+MODE_NAMES = {MODE_COMMAND: "COMMAND", MODE_TYPING: "TYPING"}
+
+# Only the keys listed here do something in command mode: a-z are hotkeys, so
+# free typing happens in typing mode.
+HELP_COMMAND = [
+    ("F1", "switch to TYPING (keys go to the target machine)"),
     ("Arrow keys", "relative mouse move (4 units)"),
     ("m", "absolute mouse to screen centre"),
     ("w / s", "wheel up / wheel down"),
-    ("c", "toggle Caps Lock"),
+    ("c", "tap Caps Lock"),
     ("p / l / k", "system: power down / sleep / wake"),
-    ("r", "reset: relative pointer to the top-left corner"),
-    (":hex ...", "send raw bytes, e.g. :hex 57 82 04 00 00 00 00 00 00 00 00 09"),
+    ("r", "relative pointer: eight steps to the top-left corner"),
+    (":hex ...", "raw bytes, e.g. :hex 57 82 04 00 00 00 00 00 00 00 00 09"),
     (":abs X Y", "absolute move, X/Y in 0..4096"),
     (":rel DX DY [W]", "relative move / scroll"),
     ("t", "ask the bridge for its state now (query + token)"),
@@ -253,12 +260,50 @@ HELP = [
     ("q", "quit"),
 ]
 
+HELP_TYPING = [
+    ("a-z A-Z 0-9 punctuation", "typed on the target machine"),
+    ("Enter  Tab  Space  Backspace", "as labelled"),
+    ("Arrow keys", "arrow keys on the target machine"),
+    ("F1  /  Esc", "back to COMMAND (Esc is not sent)"),
+    ("", ""),
+    ("", "hotkeys are off here: m/w/s/c/p/l/k/t/i type letters"),
+    ("", "quit: F1 or Esc, then q"),
+]
 
-def draw(stdscr, link, prompt):
+# Arrow keys mean something different in each mode, so keep the HID usages
+# separate from KEYMAP (which is about characters).
+ARROW_USAGE = {
+    curses.KEY_UP: 0x52,
+    curses.KEY_DOWN: 0x51,
+    curses.KEY_LEFT: 0x50,
+    curses.KEY_RIGHT: 0x4F,
+}
+
+
+def typed_key(ch):
+    """(modifier, HID usage) for a keypress in typing mode, or None."""
+    if ch in ARROW_USAGE:
+        return (0, ARROW_USAGE[ch])
+    if ch in (curses.KEY_BACKSPACE, 127, 8):
+        return (0, 0x2A)  # Backspace
+    if ch in (curses.KEY_ENTER, 10, 13):
+        return (0, 0x28)  # Enter
+    if 32 <= ch < 127:
+        c = chr(ch)
+        if c in KEYMAP:
+            return KEYMAP[c]
+        if "A" <= c <= "Z":  # shift + letter, so the target sees capitals
+            return (0x02, 0x04 + ord(c) - ord("A"))
+    return None
+
+
+def draw(stdscr, link, prompt, mode):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     st = link.last_status
-    title = f"HID CDC bridge TUI  {link.path}  tx={link.tx_frames} rx={link.rx_frames}"
+    name = MODE_NAMES[mode]
+    title = (f"HID CDC bridge TUI  {link.path}  [{name}]  "
+             f"tx={link.tx_frames} rx={link.rx_frames}")
     stdscr.attron(curses.A_REVERSE)
     stdscr.addnstr(0, 0, title.ljust(w - 1), w - 1)
     stdscr.attroff(curses.A_REVERSE)
@@ -275,17 +320,24 @@ def draw(stdscr, link, prompt):
 
     split = max(20, w // 2)
     stdscr.addnstr(2, 0, " log ".center(split - 1, "-"), split - 1)
-    stdscr.addnstr(2, split, " keys ".center(w - split - 1, "-"), w - split - 2)
+    stdscr.addnstr(2, split, f" keys ({name}) ".center(w - split - 1, "-"), w - split - 2)
 
     rows = h - 5
     entries = link.log[-rows:]
     for i, (ts, text) in enumerate(entries):
         stdscr.addnstr(3 + i, 0, f"{ts} {text}", split - 1)
 
-    for i, (keys, desc) in enumerate(HELP[:rows]):
+    helper = HELP_COMMAND if mode == MODE_COMMAND else HELP_TYPING
+    for i, (keys, desc) in enumerate(helper[:rows]):
         stdscr.addnstr(3 + i, split, f"{keys:<28} {desc}", w - split - 2)
 
-    stdscr.addnstr(h - 2, 0, ":" + prompt if prompt else "press a key, or ':' for a raw command", w - 1)
+    if prompt:
+        hint = ":" + prompt
+    elif mode == MODE_COMMAND:
+        hint = "COMMAND: hotkeys only   F1 = TYPING mode   ':' = raw command   q = quit"
+    else:
+        hint = "TYPING: every key goes to the target machine   Esc/F1 = COMMAND mode"
+    stdscr.addnstr(h - 2, 0, hint, w - 1)
     stdscr.refresh()
 
 
@@ -293,9 +345,19 @@ def run_ui(stdscr, link):
     curses.curs_set(0)
     stdscr.timeout(200)  # getch wakes every 200ms (returns -1) so incoming status frames redraw continuously
     prompt = ""
-    draw(stdscr, link, prompt)
+    mode = MODE_COMMAND
+    draw(stdscr, link, prompt, mode)
     while True:
         ch = stdscr.getch()
+
+        # F1 flips modes from either side. Esc only leaves typing mode, so that
+        # it keeps its usual meaning (quit) in command mode.
+        if ch == curses.KEY_F1 or (mode == MODE_TYPING and ch == 27):
+            mode = MODE_TYPING if mode == MODE_COMMAND else MODE_COMMAND
+            prompt = ""
+            link.add_log(f"mode: {MODE_NAMES[mode]}")
+            draw(stdscr, link, prompt, mode)
+            continue
 
         if prompt:
             if ch in (curses.KEY_ENTER, 10, 13):
@@ -307,14 +369,23 @@ def run_ui(stdscr, link):
                 prompt = prompt[:-1]
             elif 32 <= ch < 127:
                 prompt += chr(ch)
-            draw(stdscr, link, prompt)
+            draw(stdscr, link, prompt, mode)
+            continue
+
+        if mode == MODE_TYPING:
+            mapped = typed_key(ch)
+            if mapped:
+                mod, usage = mapped
+                link.send(key_frame(mod, usage), f"key usage 0x{usage:02x}")
+                link.send(key_release(), "release")
+            draw(stdscr, link, prompt, mode)
             continue
 
         if ch in (ord("q"), ord("Q"), 27):
             return
         if ch == ord(":"):
             prompt = ":"
-            draw(stdscr, link, prompt)
+            draw(stdscr, link, prompt, mode)
             continue
 
         if ch == curses.KEY_UP:
@@ -346,13 +417,7 @@ def run_ui(stdscr, link):
         elif ch == ord("r"):
             for _ in range(8):
                 link.send(rel_frame(-127, -127), "rel -127,-127 (corner)")
-        else:
-            mapped = KEYMAP.get(chr(ch)) if 32 <= ch < 127 else None
-            if mapped:
-                mod, usage = mapped
-                link.send(key_frame(mod, usage), f"key usage 0x{usage:02x}")
-                link.send(key_release(), "release")
-        draw(stdscr, link, prompt)
+        draw(stdscr, link, prompt, mode)
 
 
 def handle_command(link, cmd):

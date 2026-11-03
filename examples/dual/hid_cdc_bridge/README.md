@@ -162,6 +162,23 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 ./tools/bridge_check.py /dev/ttyACM2
 ```
 
+### Interactive TUI
+
+```bash
+./tools/cdc_tui.py            # auto-detects the cafe:4001 CDC port
+./tools/cdc_tui.py --selftest # no UI: a few frames, then what came back
+```
+
+Two modes, switched with a single key (nothing is typed on a command line):
+
+| mode | what a key does | how to get there |
+|---|---|---|
+| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `m` absolute centre, `w`/`s` wheel, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `F1` |
+| `TYPING` | the key is forwarded to the machine on the HID port: letters, capitals (shift is added), digits, punctuation, Enter / Tab / Space / Backspace, arrow keys. Hotkeys are off here, so `m`, `w`, `q` are typed instead of commanding | `F1`; leave with `F1` or `Esc` |
+
+The current mode is in the title bar, and the key list on the right always
+describes the mode you are in.
+
 > **Power note**: the two Type-C ports are wired straight to the chip. When the
 > two cables go to **different** machines, their 5 V VBUS rails meet. Use a
 > VBUS-less cable on the HID side or an isolator. Testing both ports on the
@@ -176,6 +193,7 @@ make BOARD=nanoch32v203 flash      # wlink; see ../../nanoch32v203.md for openoc
 | `src/usb_descriptors.c` | HID: keyboard + absolute mouse (interface 0), relative mouse + system control (interface 1) |
 | `src/usbfs_cdc.c` | CDC-ACM on the second controller, ring buffers |
 | `tools/bridge_check.py` | host-side acceptance test (Linux, needs `input` group) |
+| `tools/cdc_tui.py` | interactive TUI (COMMAND / TYPING modes) and `--selftest` |
 
 ## Host suspend vs unplug
 
