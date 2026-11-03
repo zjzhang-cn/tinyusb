@@ -174,6 +174,33 @@ Getting a real unmount would mean driving the HID role from the USBFS
 controller (`USBFS_SR_VBUS_VLD`) instead of FSDev, or adding an SOF-timeout
 check in the application.
 
+## Host-side serial settings
+
+The CDC link carries binary frames, so the host tool must open the port in raw
+mode with flow control off (`IXON`/`IXOFF`/`CRTSCTS`). Otherwise a `0x13` byte
+inside a frame is taken as XOFF and the tty silently stops delivering data —
+`cat /dev/ttyACM1` shows output for a while and then goes quiet, while
+`minicom` works because it sets raw mode itself.
+
+```python
+tty.setraw(fd)                                   # no ICANON / ICRNL / OPOST
+attrs = termios.tcgetattr(fd)
+attrs[2] &= ~termios.CRTSCTS
+attrs[0] &= ~(termios.IXON | termios.IXOFF)
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
+```
+
+**This was misdiagnosed as a firmware bug for a while**: the failure looked
+exactly like "the device stops transmitting after a few seconds", and several
+pump rewrites were spent on it before the termios setting was found. Bisecting
+the branch later showed every firmware version from the DCD switch onwards
+works with a raw-mode reader.
+
+`tools/cdc_tui.py` and `tools/bridge_check.py` already do this. The full story,
+and the one device-side rule that still matters (a frame armed while the host
+stops reading is retired by the 1 s safety valve), is written up in
+[CDC-IN-INVESTIGATION.md](CDC-IN-INVESTIGATION.md).
+
 ## Limits
 
 - Keyboard is 6-key rollover (`TUD_HID_REPORT_DESC_KEYBOARD`), no NKRO.
