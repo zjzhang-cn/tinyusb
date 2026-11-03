@@ -129,6 +129,7 @@ def decode_status(f):
         "itfs": itfs,
         "uptime": uptime,
         "dtr": bool(flags & 1),
+        "rts": bool(flags & 2),
         "leds": leds,
     }
 
@@ -187,8 +188,9 @@ class Link:
     @staticmethod
     def _describe_status(st):
         leds = st["leds"]
-        return ("status: %-9s itf=%d up=%us dtr=%s leds[num=%d caps=%d scr=%d]"
-                % (st["state"], st["itfs"], st["uptime"], "y" if st["dtr"] else "n",
+        return ("status: %-9s itf=%d up=%us dtr=%s rts=%s leds[num=%d caps=%d scr=%d]"
+                % (st["state"], st["itfs"], st["uptime"],
+                   "y" if st["dtr"] else "n", "y" if st["rts"] else "n",
                    leds & LED_NUM and 1 or 0, leds & LED_CAPS and 1 or 0, leds & LED_SCROLL and 1 or 0))
 
     def add_log(self, text):
@@ -262,8 +264,9 @@ def draw(stdscr, link, prompt):
     stdscr.attroff(curses.A_REVERSE)
 
     if st:
-        line = ("state=%s  HID itfs=%d  uptime=%us  host DTR=%s  LEDs: num=%d caps=%d scroll=%d"
-                % (st["state"], st["itfs"], st["uptime"], "yes" if st["dtr"] else "no",
+        line = ("state=%s  HID itfs=%d  uptime=%us  DTR=%s RTS=%s  LEDs: num=%d caps=%d scroll=%d"
+                % (st["state"], st["itfs"], st["uptime"],
+                   "yes" if st["dtr"] else "no", "yes" if st["rts"] else "no",
                    st["leds"] & LED_NUM and 1 or 0, st["leds"] & LED_CAPS and 1 or 0,
                    st["leds"] & LED_SCROLL and 1 or 0))
     else:

@@ -107,8 +107,29 @@ Frames are re-synchronised by a byte-stream parser: it scans for a valid header
 and validates the tail, dropping one byte and retrying on mismatch, so lost or
 garbage bytes cost at most one frame.
 
-The reverse direction is not used: the CDC port is write-only towards the
-device (keyboard LED reports are parsed and discarded).
+### Status and query frames (device → host)
+
+The reverse direction carries status only. A 12-byte `0x8757` frame is sent when
+something changes (keyboard LED state, the host power state, DTR/RTS) and when
+the host asks with `0x8758`, whose `token` byte is echoed back. There is **no
+heartbeat**, so a quiet link is normal; a host that wants the current state
+sends the query (measured round trip: ~0.1 ms).
+
+| offset | size | field |
+|---|---|---|
+| 0 | 2 | header `0x8757` (`57 87`) |
+| 2 | 1 | state: 0 unmounted, 1 active, 2 suspended |
+| 3 | 1 | HID interfaces configured (0 or 2) |
+| 4 | 2 | uptime seconds, wraps every ~18 h |
+| 6 | 1 | flags: bit0 = DTR, bit1 = RTS, as set by the host |
+| 7 | 1 | keyboard LEDs: bit0 num, bit1 caps, bit2 scroll |
+| 8 | 1 | token, echoed from the query |
+| 9 | 1 | reserved |
+| 10 | 2 | tail `0x0900` (`00 09`) |
+
+`flags` bit1 is new: it reports the host's own RTS line, which the firmware
+records but never uses for gating (a host that leaves DTR/RTS low still
+receives everything). Older host software that reads only bit0 is unaffected.
 
 ## Build
 

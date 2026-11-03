@@ -44,6 +44,10 @@ extern volatile uint32_t usbfs_dbg_isr_other;
 // True when the host has the port open (DTR asserted).
 bool usbfs_cdc_connected(void);
 
+// Raw CDC line state as sent by SET_CONTROL_LINE_STATE:
+// bit0 = DTR, bit1 = RTS. Reported, never used for gating.
+uint8_t usbfs_cdc_line_state(void);
+
 // True when the device is enumerated (configured), whether or not the host has
 // the port open.
 bool usbfs_cdc_enumerated(void);

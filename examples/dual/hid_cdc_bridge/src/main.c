@@ -443,7 +443,7 @@ static void status_task(void) {
   // both configured (device configured) or neither.
   st.hid_itf_count = status_state.mounted ? 2 : 0;
   st.uptime_s      = (uint16_t)(now / 1000u);
-  st.flags         = usbfs_cdc_connected() ? 0x01 : 0x00;  // bit0: DTR
+  st.flags         = usbfs_cdc_line_state();  // bit0: DTR, bit1: RTS
   st.leds          = kbd_led.known ? kbd_led.leds : 0;
   st.token         = status_state.token;
 

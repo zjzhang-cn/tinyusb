@@ -94,9 +94,10 @@ typedef struct {
   uint8_t reserved[7];
 } bridge_status_req_t;
 
-// Device -> host status frame. Sent on every state change and once per second
-// as a heartbeat, so the host can tell whether the HID side is alive and what
-// power state the machine on that port is in.
+// Device -> host status frame. Sent when something changes and when the host
+// asks with BRIDGE_HDR_STATUS_REQ (whose token is echoed), never on a timer, so
+// the host can tell whether the HID side is alive and what power state the
+// machine on that port is in.
 typedef enum {
   BRIDGE_STATE_UNMOUNTED = 0, // powered off, cable out, or not enumerated
   BRIDGE_STATE_ACTIVE = 1,    // enumerated and the bus is active
@@ -106,8 +107,8 @@ typedef enum {
 typedef struct {
   uint8_t  state;         // BRIDGE_STATE_*
   uint8_t  hid_itf_count; // HID interfaces configured (0 or 2)
-  uint16_t uptime_s;      // heartbeat counter, wraps every ~18 h
-  uint8_t  flags;         // bit0: the CDC host has this port open (DTR)
+  uint16_t uptime_s;      // seconds since boot, wraps every ~18 h
+  uint8_t  flags;         // bit0: DTR (host opened the port), bit1: RTS
   uint8_t  leds;          // keyboard LED bitmap (bit0 num, bit1 caps, bit2 scroll)
   uint8_t  token;         // echoed from BRIDGE_HDR_STATUS_REQ
   uint8_t  reserved;

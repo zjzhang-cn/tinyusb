@@ -106,7 +106,7 @@ static void make_string_descriptor(uint8_t *out, const char *text) {
 static struct {
   bool configured;
   bool suspended;
-  uint8_t line_state;      // bit0 DTR, bit1 RTS
+  uint8_t line_state;      // bit0 DTR, bit1 RTS (both only reported, never gate)
   uint8_t line_coding[7];  // 115200 8N1
   bool tx_busy;
 } dev;
@@ -170,6 +170,10 @@ uint32_t usbfs_cdc_write(void const *buf, uint32_t len) {
 
 bool usbfs_cdc_connected(void) {
   return dev.configured && (dev.line_state & 0x01);
+}
+
+uint8_t usbfs_cdc_line_state(void) {
+  return dev.line_state;
 }
 
 bool usbfs_cdc_enumerated(void) {
