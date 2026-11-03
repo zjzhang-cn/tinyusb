@@ -92,6 +92,13 @@ static struct {
   uint32_t last_ms;
 } status_state = {.dirty = true};
 
+// Keyboard LED state reported by the host (output report): bit0 num lock,
+// bit1 caps lock, bit2 scroll lock, bit3 compose, bit4 kana.
+static struct {
+  bool    known;
+  uint8_t leds;
+} kbd_led;
+
 static uint32_t        blink_interval_ms = 250;
 static bridge_parser_t parser;
 
@@ -138,11 +145,12 @@ static void log_task(void) {
 
   if ((int32_t) (now - log_state.next_ms) >= 0) {
     log_state.next_ms = now + LOG_PERIOD_MS;
-    printf("[%lu] stats: frames=%lu reports=%lu bad=%lu hid=%s cdc=%s\r\n",
+    printf("[%lu] stats: frames=%lu reports=%lu bad=%lu hid=%s cdc=%s caps=%u\r\n",
            (unsigned long) now, (unsigned long) log_state.events,
            (unsigned long) log_state.reports, (unsigned long) log_state.bad_frame,
            suspended ? "suspended" : (mounted ? "mounted" : "detached"),
-           dtr ? "open" : "closed");
+           dtr ? "open" : "closed",
+           kbd_led.known ? ((kbd_led.leds >> 1) & 1u) : 0u);
   }
 }
 
@@ -508,24 +516,33 @@ void tud_resume_cb(void) {
 // Invoked when received SET_REPORT control request or data received on OUT endpoint
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, const uint8_t *buffer,
                            uint16_t bufsize) {
-  (void)instance;
+  if (instance != HID_INSTANCE_MAIN || report_type != HID_REPORT_TYPE_OUTPUT) {
+    return;
+  }
+  if (report_id != 0 && report_id != REPORT_ID_KEYBOARD) {
+    return;
+  }
+  if (bufsize == 0) {
+    return;
+  }
 
-  if (report_type == HID_REPORT_TYPE_OUTPUT) {
-    // Keyboard LED report: keep the last state, nothing to forward (the CDC
-    // channel is write-only towards the device).
-    (void)report_id;
-    (void)buffer;
-    (void)bufsize;
+  // The CDC channel is write-only towards the device, so the LED state is
+  // only kept here and printed on the UART log.
+  if (!kbd_led.known || kbd_led.leds != buffer[0]) {
+    kbd_led.known = true;
+    kbd_led.leds = buffer[0];
+    printf("[%lu] hid: leds num=%u caps=%u scroll=%u\r\n", (unsigned long) tusb_time_millis_api(),
+           (buffer[0] >> 0) & 1u, (buffer[0] >> 1) & 1u, (buffer[0] >> 2) & 1u);
   }
 }
 
 // Invoked when received GET_REPORT control request
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer,
                                uint16_t reqlen) {
-  (void)instance;
-  (void)report_id;
-  (void)report_type;
-  (void)buffer;
-  (void)reqlen;
+  if (instance == HID_INSTANCE_MAIN && report_type == HID_REPORT_TYPE_OUTPUT && reqlen >= 1 &&
+      (report_id == 0 || report_id == REPORT_ID_KEYBOARD)) {
+    buffer[0] = kbd_led.leds;
+    return 1;
+  }
   return 0;
 }
