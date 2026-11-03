@@ -200,6 +200,9 @@ static void make_string_descriptor(uint8_t *out, const char *text) {
 
 static const uint8_t *desc_ptr;
 
+// TEMP diagnostics: [0]=setups [1]=stalls [2]=last type|code [3]=last wValue [4]=last wIndex
+volatile uint32_t dbg[8];
+
 //--------------------------------------------------------------------+
 // Driver state
 //--------------------------------------------------------------------+
@@ -285,6 +288,10 @@ bool usbfs_cdc_connected(void) {
   return dev_enum && (line_state & 0x01);
 }
 
+bool usbfs_cdc_enumerated(void) {
+  return dev_enum;
+}
+
 //--------------------------------------------------------------------+
 // Endpoints
 //--------------------------------------------------------------------+
@@ -306,7 +313,7 @@ static void usbfs_ep_init(void) {
 
   USBFSD->UEP0_TX_CTRL = USBFS_UEP_T_RES_NAK;
   USBFSD->UEP1_TX_CTRL = USBFS_UEP_T_RES_NAK;
-  USBFSD->UEP3_TX_CTRL = USBFS_UEP_T_RES_NAK;
+  USBFSD->UEP3_TX_CTRL = USBFS_UEP_T_AUTO_TOG | USBFS_UEP_T_RES_NAK;
 
   for (uint8_t i = 0; i < DEF_UEP_NUM; i++) {
     ep_busy[i] = 0;
@@ -410,7 +417,12 @@ static void usbfs_setup_stage(void) {
           break;
 
         case CDC_SET_LINE_CODING: // data arrives in the OUT stage
-        case CDC_SET_LINE_CTLSTE:
+          break;
+
+        case CDC_SET_LINE_CTLSTE: // wValue bit0 = DTR, bit1 = RTS
+          line_state = (uint8_t) (setup_req_value & 0x03);
+          break;
+
         case CDC_SEND_BREAK:
           break;
 
@@ -512,7 +524,7 @@ static void usbfs_setup_stage(void) {
                 USBFSD->UEP2_RX_CTRL = USBFS_UEP_R_RES_ACK;
                 break;
               case (DEF_UEP_IN | EP_DATA_IN):
-                USBFSD->UEP3_TX_CTRL = USBFS_UEP_T_RES_NAK;
+                USBFSD->UEP3_TX_CTRL = USBFS_UEP_T_AUTO_TOG | USBFS_UEP_T_RES_NAK;
                 break;
               default:
                 errflag = 0xff;
@@ -616,6 +628,7 @@ static void usbfs_setup_stage(void) {
   }
 
   if (errflag == 0xff) {
+    dbg[1]++;
     USBFSD->UEP0_TX_CTRL = USBFS_UEP_T_TOG | USBFS_UEP_T_RES_STALL;
     USBFSD->UEP0_RX_CTRL = USBFS_UEP_R_TOG | USBFS_UEP_R_RES_STALL;
     return;
@@ -669,8 +682,8 @@ static void usbfs_in_stage(uint8_t intst) {
       break;
 
     case (USBFS_UIS_TOKEN_IN | DEF_UEP3):
-      USBFSD->UEP3_TX_CTRL ^= USBFS_UEP_T_TOG;
-      USBFSD->UEP3_TX_CTRL = (USBFSD->UEP3_TX_CTRL & ~USBFS_UEP_T_RES_MASK) | USBFS_UEP_T_RES_NAK;
+      // The toggle is hardware handled (AUTO_TOG); only withdraw the data.
+      USBFSD->UEP3_TX_CTRL = USBFS_UEP_T_AUTO_TOG | USBFS_UEP_T_RES_NAK;
       ep_busy[EP_DATA_IN]  = 0;
       break;
 
