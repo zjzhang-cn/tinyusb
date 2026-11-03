@@ -173,11 +173,13 @@ Two modes, switched with a single key (nothing is typed on a command line):
 
 | mode | what a key does | how to get there |
 |---|---|---|
-| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `m` absolute centre, `w`/`s` wheel, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `F1` |
-| `TYPING` | the key is forwarded to the machine on the HID port: letters, capitals (shift is added), digits, punctuation, Enter / Tab / Space / Backspace, arrow keys. Hotkeys are off here, so `m`, `w`, `q` are typed instead of commanding | `F1`; leave with `F1` or `Esc` |
+| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `m` absolute centre, `w`/`s` wheel, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `Ctrl-]` |
+| `TYPING` | the key is forwarded to the machine on the HID port: letters, capitals (shift is added), digits, punctuation, Enter / Tab / Space / Backspace, arrow keys. Hotkeys are off here, so `m`, `w`, `q` are typed instead of commanding | `Ctrl-]`; leave with `Ctrl-]` or `Esc` |
 
 The current mode is in the title bar, and the key list on the right always
-describes the mode you are in.
+describes the mode you are in. The toggle is `Ctrl-]` (`0x1d`, one byte) rather
+than a function key because IDEs such as VS Code grab `F1` before the terminal
+sees it; `F1` still works where the terminal forwards it.
 
 > **Power note**: the two Type-C ports are wired straight to the chip. When the
 > two cables go to **different** machines, their 5 V VBUS rails meet. Use a

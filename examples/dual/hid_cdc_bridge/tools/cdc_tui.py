@@ -2,7 +2,7 @@
 """
 Interactive (curses) terminal for manually exercising the HID CDC bridge.
 
-Two modes, switched with a single key (F1, or Esc from typing mode):
+Two modes, switched with a single key (Ctrl-], or Esc from typing mode):
 
   COMMAND  every key is a hotkey (mouse, wheel, system keys, status query, ...)
   TYPING   every key is forwarded to the machine on the HID port
@@ -240,12 +240,13 @@ class Link:
 # ---------------------------------------------------------------------------
 
 MODE_COMMAND, MODE_TYPING = 0, 1
+TOGGLE_KEY = 0x1D  # Ctrl-]: one byte, forwarded by terminals and IDEs
 MODE_NAMES = {MODE_COMMAND: "COMMAND", MODE_TYPING: "TYPING"}
 
 # Only the keys listed here do something in command mode: a-z are hotkeys, so
 # free typing happens in typing mode.
 HELP_COMMAND = [
-    ("F1", "switch to TYPING (keys go to the target machine)"),
+    ("Ctrl-]", "switch to TYPING (keys go to the target machine)"),
     ("Arrow keys", "relative mouse move (4 units)"),
     ("m", "absolute mouse to screen centre"),
     ("w / s", "wheel up / wheel down"),
@@ -264,10 +265,10 @@ HELP_TYPING = [
     ("a-z A-Z 0-9 punctuation", "typed on the target machine"),
     ("Enter  Tab  Space  Backspace", "as labelled"),
     ("Arrow keys", "arrow keys on the target machine"),
-    ("F1  /  Esc", "back to COMMAND (Esc is not sent)"),
+    ("Ctrl-]  /  Esc", "back to COMMAND (Esc is not sent)"),
     ("", ""),
     ("", "hotkeys are off here: m/w/s/c/p/l/k/t/i type letters"),
-    ("", "quit: F1 or Esc, then q"),
+    ("", "quit: Ctrl-] or Esc, then q"),
 ]
 
 # Arrow keys mean something different in each mode, so keep the HID usages
@@ -334,15 +335,16 @@ def draw(stdscr, link, prompt, mode):
     if prompt:
         hint = ":" + prompt
     elif mode == MODE_COMMAND:
-        hint = "COMMAND: hotkeys only   F1 = TYPING mode   ':' = raw command   q = quit"
+        hint = "COMMAND: hotkeys only   Ctrl-] = TYPING mode   ':' = raw command   q = quit"
     else:
-        hint = "TYPING: every key goes to the target machine   Esc/F1 = COMMAND mode"
+        hint = "TYPING: every key goes to the target machine   Esc/Ctrl-] = COMMAND mode"
     stdscr.addnstr(h - 2, 0, hint, w - 1)
     stdscr.refresh()
 
 
 def run_ui(stdscr, link):
     curses.curs_set(0)
+    curses.set_escdelay(25)  # Esc must not wait a second before it arrives
     stdscr.timeout(200)  # getch wakes every 200ms (returns -1) so incoming status frames redraw continuously
     prompt = ""
     mode = MODE_COMMAND
@@ -350,9 +352,11 @@ def run_ui(stdscr, link):
     while True:
         ch = stdscr.getch()
 
-        # F1 flips modes from either side. Esc only leaves typing mode, so that
-        # it keeps its usual meaning (quit) in command mode.
-        if ch == curses.KEY_F1 or (mode == MODE_TYPING and ch == 27):
+        # Ctrl-] flips modes from either side: it is a single byte (0x1d) that
+        # every terminal forwards, unlike F1, which IDEs such as VS Code grab
+        # for themselves. Esc only leaves typing mode, so that it keeps its
+        # usual meaning (quit) in command mode.
+        if ch in (TOGGLE_KEY, curses.KEY_F1) or (mode == MODE_TYPING and ch == 27):
             mode = MODE_TYPING if mode == MODE_COMMAND else MODE_COMMAND
             prompt = ""
             link.add_log(f"mode: {MODE_NAMES[mode]}")
