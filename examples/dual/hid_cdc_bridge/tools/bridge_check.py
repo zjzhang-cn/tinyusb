@@ -28,7 +28,6 @@ FRAME = struct.Struct("<H8sH")
 TAIL = 0x0900
 HDR_KEY = 0x8257
 HDR_MOUSE_MOVE = 0x8357
-HDR_MOUSE_BUTTON = 0x8457
 HDR_MOUSE_REL = 0x8557
 HDR_SYSTEM_KEY = 0x8657
 HDR_STATUS = 0x8757  # device -> host status, event driven (no heartbeat)
@@ -270,19 +269,20 @@ def main() -> int:
             failures += expect(abs(pos.get(ABS_Y, -1) - expecting) < 200,
                                f"ABS_Y ~{expecting} (got {pos.get(ABS_Y)})")
 
-        # 3. absolute button-only frame must not move the pointer
-        print("mouse button press (position must not jump)")
+        # 3. buttons ride the move frame, so a click repeats the position the
+        #    device already holds and the pointer does not move
+        print("mouse button press in a move frame (same position: no jump)")
         if abs_mouse:
             abs_mouse.read(0.1)
-        os.write(fd, mouse_frame(HDR_MOUSE_BUTTON, 0x01, 0, 0))
+        os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0x01, target, target))
         if abs_mouse:
             ev = abs_mouse.read(1.0)
             pos = {c: v for (t, c, v) in ev if t == EV_ABS}
             keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
             failures += expect((BTN_LEFT, 1) in keys, f"BTN_LEFT down seen (got {keys})")
-            failures += expect(ABS_X not in pos or abs(pos[ABS_X] - expecting) < 200,
+            failures += expect(ABS_X not in pos,
                                f"ABS_X unchanged (got {pos.get(ABS_X)})")
-        os.write(fd, mouse_frame(HDR_MOUSE_BUTTON, 0x00, 0, 0))
+        os.write(fd, mouse_frame(HDR_MOUSE_MOVE, 0x00, target, target))
         if abs_mouse:
             abs_mouse.read(0.5)
 
@@ -323,7 +323,23 @@ def main() -> int:
             rel = {c: v for (t, c, v) in ev if t == EV_REL}
             failures += expect(rel.get(REL_WHEEL, 0) == 2, f"REL_WHEEL 2 (got {rel.get(REL_WHEEL)})")
 
-        # 6. system control: power down is a momentary key
+        # 6. a click needs no position: a zero-delta relative frame carries the
+        #    button change on the relative pointer
+        print("relative pointer click (no position needed)")
+        if rel_mouse:
+            rel_mouse.read(0.1)
+        os.write(fd, mouse_frame(HDR_MOUSE_REL, 0x01, 0, 0))
+        if rel_mouse:
+            ev = rel_mouse.read(1.0)
+            keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
+            failures += expect((BTN_LEFT, 1) in keys, f"BTN_LEFT down seen (got {keys})")
+        os.write(fd, mouse_frame(HDR_MOUSE_REL, 0x00, 0, 0))
+        if rel_mouse:
+            ev = rel_mouse.read(1.0)
+            keys = [(c, v) for (t, c, v) in ev if t == EV_KEY]
+            failures += expect((BTN_LEFT, 0) in keys, f"BTN_LEFT up seen (got {keys})")
+
+        # 7. system control: power down is a momentary key
         print("system control key (grabbed, cannot reach the desktop)")
         if system:
             system.read(0.1)
@@ -339,7 +355,7 @@ def main() -> int:
             if system:
                 system.grab(False)
 
-        # 7. Lock-key state is reported back over CDC (status frame 0x8757),
+        # 8. Lock-key state is reported back over CDC (status frame 0x8757),
         #    using Num Lock: the host toggles it and writes an LED output report,
         #    which the firmware turns into a status event. The host occasionally
         #    coalesces two quick toggles, so retry until the bit flips instead of
@@ -362,7 +378,7 @@ def main() -> int:
             previous = leds
         failures += expect(toggled, f"num lock bit flips after a toggle (attempts={attempt + 1})")
 
-        # 8. resynchronisation: garbage in front of a valid frame
+        # 9. resynchronisation: garbage in front of a valid frame
         print("resync after garbage")
         if abs_mouse:
             abs_mouse.read(0.1)

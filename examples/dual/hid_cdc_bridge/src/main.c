@@ -49,6 +49,9 @@
 #define MOUSE_POS_IN_MAX  4096
 #define MOUSE_POS_OUT_MAX 32767
 
+// There is no button-only frame: an absolute click repeats the last position,
+// so the position fields of the report are the click's coordinates. A relative
+// click (same buttons, zero deltas) needs no position and lands on interface 1.
 typedef struct {
   bool    dirty;
   uint8_t buttons;
@@ -215,14 +218,6 @@ static void apply_mouse_move(const bridge_mouse_t *mouse) {
   mouse_state.dirty = true;
 }
 
-static void apply_mouse_button(const bridge_mouse_t *mouse) {
-  // Button-only frame: keep the last absolute position (sending 0,0 would
-  // teleport the pointer to the corner on an absolute mouse). Pending wheel
-  // deltas are kept until a report actually goes out.
-  mouse_state.buttons = mouse->buttons;
-  mouse_state.dirty   = true;
-}
-
 static int16_t saturating_add_i16(int16_t sum, int32_t delta) {
   const int32_t total = (int32_t)sum + delta;
   if (total > 32767) {
@@ -262,9 +257,6 @@ static void handle_event(const bridge_evt_t *evt) {
       break;
     case BRIDGE_EVT_MOUSE_MOVE:
       apply_mouse_move(&evt->mouse);
-      break;
-    case BRIDGE_EVT_MOUSE_BUTTON:
-      apply_mouse_button(&evt->mouse);
       break;
     case BRIDGE_EVT_MOUSE_REL_MOVE:
       apply_mouse_rel_move(&evt->mouse_rel);

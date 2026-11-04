@@ -16,8 +16,8 @@ Usage:
 
 Frame format (see ../README.md): 12 bytes, little endian
   header | payload[8] | tail 0x0900
-  host -> device: 0x8257 keyboard, 0x8357 abs mouse, 0x8457 mouse buttons,
-                  0x8557 relative mouse, 0x8657 system key
+  host -> device: 0x8257 keyboard, 0x8357 absolute mouse, 0x8557 relative
+                  mouse, 0x8657 system key
   device -> host: 0x8757 status (state, hid_itf_count, uptime, flags, leds)
 """
 
@@ -38,7 +38,6 @@ TAIL = 0x0900
 
 HDR_KEY = 0x8257
 HDR_MOUSE_ABS = 0x8357
-HDR_MOUSE_BTN = 0x8457
 HDR_MOUSE_REL = 0x8557
 HDR_SYSTEM = 0x8657
 HDR_STATUS = 0x8757
@@ -88,20 +87,21 @@ def abs_frame(x, y, buttons=0, wheel=0):
     return frame(HDR_MOUSE_ABS, struct.pack("<Bbhhbb", buttons, 0, x, y, wheel, 0))
 
 
-def rel_frame(dx, dy, wheel=0):
-    return frame(HDR_MOUSE_REL, struct.pack("<Bbhhbb", 0, 0, dx, dy, wheel, 0))
-
-
-def button_frame(buttons):
-    # x/y are ignored for a button frame: the pointer must not jump on a click.
-    return frame(HDR_MOUSE_BTN, struct.pack("<Bbhhbb", buttons, 0, 0, 0, 0, 0))
+def rel_frame(dx, dy, wheel=0, buttons=0):
+    return frame(HDR_MOUSE_REL, struct.pack("<Bbhhbb", buttons, 0, dx, dy, wheel, 0))
 
 
 def click(link, buttons, name, hold=0.05):
-    """Press and release: a terminal cannot report a key release."""
-    link.send(button_frame(buttons), f"{name} down")
+    """Press and release: a terminal cannot report a key release.
+
+    Zero-delta relative frames: the relative pointer needs no coordinates, so a
+    click works without knowing where the absolute pointer sits. Press and
+    release both go to this pointer — its button state is separate from the
+    absolute one's, so they must not be mixed.
+    """
+    link.send(rel_frame(0, 0, buttons=buttons), f"{name} down (relative pointer)")
     time.sleep(hold)
-    link.send(button_frame(0), f"{name} up")
+    link.send(rel_frame(0, 0), f"{name} up (relative pointer)")
 
 
 def system_frame(code):
@@ -262,7 +262,7 @@ MODE_NAMES = {MODE_COMMAND: "COMMAND", MODE_TYPING: "TYPING"}
 HELP_COMMAND = [
     ("Ctrl-]", "switch to TYPING (keys go to the target machine)"),
     ("Arrow keys", "relative mouse move (4 units)"),
-    ("[ / ]", "left / right mouse click"),
+    ("[ / ]", "left / right click (relative pointer, no position needed)"),
     ("m", "absolute mouse to screen centre"),
     ("w / s", "wheel up / wheel down"),
     ("c", "tap Caps Lock"),

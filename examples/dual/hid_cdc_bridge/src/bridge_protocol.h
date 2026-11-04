@@ -1,21 +1,24 @@
 /*
  * Wire protocol carried over the CDC serial port.
  *
- * Kept byte-compatible with the existing "esp32_hid" product so the PC side
- * needs no change: fixed 12-byte little-endian frames
+ * Frame layout and headers follow the existing "esp32_hid" product, so the PC
+ * side needs only small changes: fixed 12-byte little-endian frames
  *
  *     uint16 header | uint8 data[8] | uint16 tail
  *
  *   header 0x8257 -> keyboard  (modifier, reserved, keycode[6])
- *   header 0x8357 -> mouse move, absolute (button, reserved, x, y, wheel, pan)
- *   header 0x8457 -> mouse button (button, reserved, ...)
- *   header 0x8557 -> mouse move, relative (button, reserved, dx, dy, wheel, pan)
+ *   header 0x8357 -> mouse, absolute (button, reserved, x, y, wheel, pan)
+ *   header 0x8557 -> mouse, relative (button, reserved, dx, dy, wheel, pan)
  *   header 0x8657 -> system key (power down / sleep / wake up)
  *   header 0x8757 -> status, device -> host only (state of the HID port)
  *   tail   0x0900
  *
- * The first three headers are the ones the previous ESP32 based product used;
- * 0x8557 and 0x8657 are additions and can be ignored by older host software.
+ * Only 0x8257 and 0x8357 come from the previous ESP32 based product, which
+ * also had a button-only mouse frame (0x8457). That frame is gone: every mouse
+ * frame already carries the button bitmap, so a click is a press frame plus a
+ * release frame. The relative pair needs no position at all (dx = dy = 0); the
+ * absolute pair repeats the last x/y, because 0,0 would move the pointer into
+ * the corner of an absolute device.
  *
  * The parser is a byte-stream state machine: CDC delivers arbitrary chunk
  * boundaries, so frames are re-synchronised by scanning for a valid header
@@ -38,7 +41,6 @@ extern "C" {
 
 #define BRIDGE_HDR_KEYBOARD       0x8257
 #define BRIDGE_HDR_MOUSE_MOVE     0x8357
-#define BRIDGE_HDR_MOUSE_BUTTON   0x8457
 #define BRIDGE_HDR_MOUSE_REL_MOVE 0x8557
 #define BRIDGE_HDR_SYSTEM_KEY     0x8657
 
@@ -60,7 +62,6 @@ typedef enum {
   BRIDGE_EVT_NONE = 0,
   BRIDGE_EVT_KEYBOARD,
   BRIDGE_EVT_MOUSE_MOVE,
-  BRIDGE_EVT_MOUSE_BUTTON,
   BRIDGE_EVT_MOUSE_REL_MOVE,
   BRIDGE_EVT_SYSTEM_KEY,
   BRIDGE_EVT_STATUS_REQ,
@@ -72,6 +73,8 @@ typedef struct {
   uint8_t keycode[6];
 } bridge_keyboard_t;
 
+// buttons ride every mouse frame, so pressing and releasing a button is two of
+// these; the relative form needs no position, the absolute form repeats x/y.
 typedef struct {
   uint8_t buttons;
   int8_t  reserved;

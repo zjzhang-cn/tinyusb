@@ -40,19 +40,22 @@ is the interface between the two.
 
 ## Wire protocol
 
-Byte-compatible with the previous ESP32 based product, so the host software
-does not change. Little-endian, fixed length (Chinese protocol reference:
+Little-endian, fixed length (Chinese protocol reference:
 [PROTOCOL.zh-CN.md](PROTOCOL.zh-CN.md)):
 
 | offset | size | field |
 |---|---|---|
-| 0 | 2 | header: `0x8257` keyboard, `0x8357` absolute mouse move, `0x8457` mouse button, **`0x8557` relative mouse move**, **`0x8657` system key** |
+| 0 | 2 | header: `0x8257` keyboard, `0x8357` absolute mouse, **`0x8557` relative mouse**, **`0x8657` system key** |
 | 2 | 8 | payload |
 | 10 | 2 | tail: `0x0900` |
 
-On the wire the header/tail bytes are `57 82` / `57 83` / `57 84` / `57 85` / `57 86`
-and `00 09`. The first three are the original ESP32 product's; the last two are
-additions, so older host software keeps working unchanged.
+On the wire the header/tail bytes are `57 82` / `57 83` / `57 85` / `57 86`
+and `00 09`. The first two are the previous ESP32 product's, which also had a
+button-only mouse frame (`0x8457`, `57 84`): that one is **removed**, because
+every mouse frame already carries the button bitmap and a click needs no frame
+of its own (see **Mouse payload**). Host software that still sends `0x8457`
+keeps working, only its clicks are dropped — the parser rejects the header as
+noise.
 
 Device → host frames use `0x8757` (status), and the host polls with `0x8758`
 (query); both are described under **Status frame** below.
@@ -80,10 +83,20 @@ Rules applied by the firmware:
 
 - **Position**: `x`/`y` (0…4096) map to the 0…32767 absolute range of the HID
   report descriptor (`×8`, clamped).
-- **Position-free frames**: a `0x8457` frame (button only) keeps the last
-  position. A `0x8357` frame whose `x`/`y` are both 0 but which carries
-  wheel/pan is treated as scroll-only and also keeps the last position —
-  otherwise the pointer would jump to the corner on every scroll.
+- **Clicks**: there is no button-only frame, because the button bitmap rides
+  every mouse frame. Two ways to click, both as a press frame plus a release
+  frame:
+  - `0x8557` with `dx`/`dy` = 0 and only the buttons changed needs **no
+    position**; the cursor stays where the target OS has it. Use this when the
+    host does not track the absolute pointer.
+  - `0x8357` repeating the position of the last absolute frame also clicks in
+    place, but the host has to track that position: `x`/`y` both 0 mean the
+    corner, not "wherever the pointer was".
+  - Press and release must go to the **same** pointer: the absolute and the
+    relative device keep separate button state.
+- **Scroll-only frames**: a `0x8357` frame whose `x`/`y` are both 0 but which
+  carries wheel/pan keeps the last position — otherwise the pointer would jump
+  to the corner on every scroll.
 - **Wheel/pan** are deltas. Several frames can arrive before one HID report
   goes out (1 ms interval), so they are accumulated and saturated to ±127.
   They are cleared once a report is actually sent.
@@ -107,6 +120,10 @@ can just send `code` and does not need to track button-up.
 cursor. Deltas are accumulated across frames and split into one report per
 millisecond (max ±127 per axis per report), so no movement is lost when the
 host sends faster than the 1 kHz endpoint.
+
+Zero deltas with only the button bitmap changed is a plain click: the frame
+still produces one report, so the button press (and its release) reach the
+target without any coordinate at all.
 
 The relative pointer lives on a **second HID interface**. Linux's hid-input
 ignores a HID usage that is already mapped on the same device, and the absolute
@@ -233,7 +250,7 @@ Two modes, switched with a single key (nothing is typed on a command line):
 
 | mode | what a key does | how to get there |
 |---|---|---|
-| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `[` / `]` left / right click (press, then release 50 ms later — a terminal cannot report a key release), `m` absolute centre, `w`/`s` wheel, `r` eight steps back to the top-left corner, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `Ctrl-]` |
+| `COMMAND` | the key is a hotkey: arrows move the relative pointer, `[` / `]` left / right click on the relative pointer (press, then release 50 ms later — a terminal cannot report a key release), `m` absolute centre, `w`/`s` wheel, `r` eight steps back to the top-left corner, `c` Caps Lock, `p`/`l`/`k` power / sleep / wake, `t` status query, `i` raw hex of the last status frame, `:hex` / `:abs` / `:rel` raw commands, `q` quit | startup default, `Ctrl-]` |
 | `TYPING` | the key is forwarded to the machine on the HID port: letters, capitals (shift is added), digits, punctuation, Enter / Tab / Space / Backspace, arrow keys. Hotkeys are off here, so `m`, `w`, `q` are typed instead of commanding | `Ctrl-]`; leave with `Ctrl-]` or `Esc` |
 
 The current mode is in the title bar, and the key list on the right always
@@ -258,7 +275,7 @@ forwards it. `Esc` only leaves `TYPING`; in `COMMAND` it (like `q`) quits.
 | `src/usbfs_cdc.c` | mini CDC-ACM on the second controller: descriptors, requests, ring buffers, serialized TX pump |
 | `src/usbfs_dcd.c` | TinyUSB's WCH USBFS controller driver, copied and renamed `usbfs_dcd_*` |
 | `src/usbfs_mini.h` | interface between the DCD copy and the mini stack (events in, endpoint calls out) |
-| `tools/bridge_check.py` | host-side acceptance test (keyboard, both pointers, wheel, system key, LED read-back, resync; Linux, needs `input` group; `--no-evdev` only sends frames) |
+| `tools/bridge_check.py` | host-side acceptance test (keyboard, both pointers, clicks, wheel, system key, LED read-back, resync; Linux, needs `input` group; `--no-evdev` only sends frames) |
 | `tools/cdc_tui.py` | interactive TUI (COMMAND / TYPING modes) and `--selftest` |
 | `PROTOCOL.zh-CN.md` | Chinese protocol reference for the CDC link |
 
@@ -345,6 +362,8 @@ milliseconds and never trips the valve.
   unreliable on this part, and the DCD already handles a bidirectional EP2.
 - Frames are applied as they arrive; mouse moves are coalesced to one pending
   report so a burst cannot outrun the 1 ms interrupt endpoint.
+- A click is two frames (press, release) of either mouse frame and needs no
+  button-only frame; the relative one needs no position at all.
 
 ## Diagnostics over USART1
 
@@ -382,7 +401,8 @@ line and `hid: bus resume` 4 ms later, followed by the system key itself.
 | enumeration | `cafe:4004` **TinyUSB HID Bridge** and `cafe:4001` **TinyUSB CDC Bridge**; the HID side yields 4 input devices: Keyboard, Mouse (ABS 0…32767), Mouse (REL), System Control |
 | keyboard frame | `KEY_A` down/up seen on `/dev/input/eventX` |
 | absolute position | `2048/4096` → `16384/32767`, `1024/4096` → `8192/32767` |
-| button-only frame | `BTN_LEFT` down, pointer does not move |
+| click, absolute (two `0x8357` frames repeating the position) | `BTN_LEFT` down, pointer does not move |
+| click, relative (two `0x8557` frames, zero deltas) | `BTN_LEFT` down/up on the relative device, no position state |
 | wheel / pan | `REL_WHEEL` +1 / −1, `REL_HWHEEL` +1, pointer does not move (scroll-only) |
 | wheel + position in one frame | `REL_WHEEL` 2 **and** `ABS_X/Y` updated |
 | relative pointer (`0x8557`) | `REL_X`/`REL_Y` deltas and `REL_WHEEL` on the relative input device |
@@ -404,4 +424,5 @@ the commits after it only touched the host tools, so they still describe the
 current firmware. The behavioural rows were measured as each feature landed, on
 the two-port rig (both ports on one Linux host unless stated otherwise).
 Re-measure sizes with `tools/code_size.py` and re-run `tools/bridge_check.py`
-after changing the firmware.
+after changing the firmware. The click rows need a run with the two-frame
+forms, since the button-only frame they were measured with is gone.
